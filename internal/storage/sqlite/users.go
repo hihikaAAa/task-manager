@@ -45,16 +45,23 @@ func (d *DB) SetWorkerProfile(ctx context.Context, tgID int64, name, team string
 }
 
 func (d *DB) ListTeams(ctx context.Context) ([]string, error) {
-    rows, err := d.SQL.QueryContext(ctx, `SELECT DISTINCT team FROM users WHERE role='worker' AND team IS NOT NULL AND team <> '' ORDER BY team`)
+    rows, err := d.SQL.QueryContext(ctx, `SELECT name FROM departments ORDER BY name`)
     if err != nil { return nil, err }
     defer rows.Close()
     var teams []string
     for rows.Next() {
-        var t sql.NullString
-        if err := rows.Scan(&t); err != nil { return nil, err }
-        if t.Valid { teams = append(teams, t.String) }
+        var name string
+        if err := rows.Scan(&name); err != nil { return nil, err }
+        teams = append(teams, name)
     }
     return teams, nil
+}
+
+func (d *DB) SetWorkerTeamByDeptID(ctx context.Context, tgID, deptID int64) error {
+    dep, err := d.GetDepartmentByID(ctx, deptID)
+    if err != nil { return err }
+    _, err = d.SQL.ExecContext(ctx, `UPDATE users SET team=? WHERE tg_id=?`, dep.Name, tgID)
+    return err
 }
 
 func (d *DB) ListWorkersByTeam(ctx context.Context, team string) ([]*User, error) {

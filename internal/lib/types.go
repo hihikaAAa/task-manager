@@ -9,6 +9,9 @@ const (
     StateNewTaskDeadline  = "newtask_deadline"
     StateNewTaskReminders = "newtask_reminders"
     StateAwaitResult      = "await_result"
+    StateNewTaskTitle   = "newtask_title"   
+    StateNewTaskBody    = "newtask_body"    
+    StateErrorReport    = "error_report"    
 )
 
 type NewTaskDraft struct {

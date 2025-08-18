@@ -2,5 +2,5 @@ bot_token: "7371922597:AAHFW4ZWJVQtiRkXKj9AdQChSW3AkxNhVXk"
 db_path: "/opt/task-manager/data/bot.db"
 boss_ids:
   - 653296078
-  #- 435431096
+  - 435431096
 timezone: "Europe/Moscow"

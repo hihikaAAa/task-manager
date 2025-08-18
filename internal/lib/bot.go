@@ -22,13 +22,24 @@ type Bot struct {
     TZ     *time.Location
 }
 
+var menuKB = tgbotapi.NewReplyKeyboard(
+    tgbotapi.NewKeyboardButtonRow(tgbotapi.NewKeyboardButton("Menu")),
+)
+
+func init() {
+    menuKB.OneTimeKeyboard = false
+    menuKB.ResizeKeyboard = true
+}
+
 func NewBot(api *tgbotapi.BotAPI, db *sqlite.DB, bossIDs []int64, tz *time.Location) *Bot {
     m := map[int64]bool{}
     for _, id := range bossIDs { m[id] = true }
     return &Bot{API: api, DB: db, BossIDs: m, TZ: tz}
 }
 
-func (b *Bot) isBoss(tgID int64) bool { return b.BossIDs[tgID] }
+func (b *Bot) isBoss(tgID int64) bool { 
+    return b.BossIDs[tgID]
+ }
 
 func (b *Bot) Start() error {
     upd := tgbotapi.NewUpdate(0)
@@ -39,6 +50,18 @@ func (b *Bot) Start() error {
         if update.CallbackQuery != nil { go b.handleCallback(update.CallbackQuery) }
     }
     return nil
+}
+
+func (b *Bot) showMenu(chatID int64, boss bool) {
+    var txt string
+    if boss {
+        txt = "Меню:\n/newtask — выдать задание\n/allactive — активные задачи\n/users — список сотрудников\n/del <tg_id> — удалить сотрудника\n/dept_add <name>\n/dept_list\n/dept_del <id>\n/mytasks — мои задачи\n/teamtasks — задачи моей команды\n/error <сообщение> — отправить ошибку боссу"
+    } else {
+        txt = "Меню:\n/register — регистрация/обновить отдел\n/mytasks — мои задачи\n/teamtasks — задачи моей команды\n/error <сообщение> — отправить ошибку боссу"
+    }
+    msg := tgbotapi.NewMessage(chatID, txt)
+    msg.ReplyMarkup = menuKB
+    b.API.Send(msg)
 }
 
 func (b *Bot) handleMessage(m *tgbotapi.Message) {
@@ -55,9 +78,12 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
             b.DB.SaveState(ctx, m.From.ID, StateRegName, nil)
             b.reply(m.Chat.ID, "Введите ФИО сотрудника (пример: Иванов Иван):")
         case "newtask":
-            if !b.isBoss(m.From.ID) { b.reply(m.Chat.ID, "Команда доступна только боссам."); return }
-            b.DB.SaveState(ctx, m.From.ID, StateNewTaskWaitBody, &NewTaskDraft{})
-            b.reply(m.Chat.ID, "Опишите задание текстом ИЛИ пришлите голосовое сообщение. Первая строка может быть заголовком.")
+            if !b.isBoss(m.From.ID) { 
+                b.reply(m.Chat.ID, "Команда доступна только боссам."); 
+            return 
+            }
+            b.DB.SaveState(ctx, m.From.ID, StateNewTaskTitle, &NewTaskDraft{})
+            b.reply(m.Chat.ID, "Введите НАЗВАНИЕ задачи (только текстом):")
         case "mytasks":
             b.cmdMyTasks(m)
         case "teamtasks":
@@ -71,47 +97,118 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
         case "del":
             if !b.isBoss(m.From.ID) { b.reply(m.Chat.ID, "Только для боссов."); return }
             b.cmdDeleteUser(m)
+        case "menu":
+            b.showMenu(m.Chat.ID, b.isBoss(m.From.ID))
+            return
+        case "dept_add":
+            if !b.isBoss(m.From.ID) { b.reply(m.Chat.ID, "Только для боссов."); return }
+            name := strings.TrimSpace(m.CommandArguments())
+            if name == "" { 
+                b.reply(m.Chat.ID, "Использование: /dept_add <название>");
+                 return
+                 }
+            _, err := b.DB.CreateDepartment(ctx, name, nil)
+            if err != nil { 
+                b.reply(m.Chat.ID, "Ошибка: "+err.Error());
+                 return 
+                }
+            b.reply(m.Chat.ID, "Отдел создан: "+name)
+        case "dept_list":
+            if !b.isBoss(m.From.ID) { b.reply(m.Chat.ID, "Только для боссов."); return }
+            deps, _ := b.DB.ListDepartments(ctx)
+            if len(deps)==0 { 
+                b.reply(m.Chat.ID, "Отделов нет.");
+                 return 
+                }
+            var sb strings.Builder
+            sb.WriteString("Отделы:\n")
+            for _, d := range deps { sb.WriteString(fmt.Sprintf("- [%d] %s\n", d.ID, d.Name)) }
+            sb.WriteString("\nУдалить: /dept_del <id>")
+            b.reply(m.Chat.ID, sb.String())
+        case "dept_del":
+            if !b.isBoss(m.From.ID) { 
+                b.reply(m.Chat.ID, "Только для боссов."); 
+                return 
+            }
+            idStr := strings.TrimSpace(m.CommandArguments())
+            id, err := strconv.ParseInt(idStr, 10, 64); if err != nil { b.reply(m.Chat.ID, "id должен быть числом"); return }
+            if err := b.DB.DeleteDepartment(ctx, id); err != nil { b.reply(m.Chat.ID, "Ошибка: "+err.Error()); return }
+            b.reply(m.Chat.ID, "Отдел удалён.")
+        case "error":
+            arg := strings.TrimSpace(m.CommandArguments())
+            if arg == "" {
+                b.DB.SaveState(ctx, m.From.ID, StateErrorReport, nil)
+                b.reply(m.Chat.ID, "Опишите проблему одним сообщением — я передам её боссу.")
+                return
+            }
+            b.forwardError(m.From, arg)
+            b.reply(m.Chat.ID, "Спасибо! Сообщение об ошибке отправлено.")
+            return
         default:
             b.reply(m.Chat.ID, "Неизвестная команда.")
         }
         return
     }
-
+    if strings.EqualFold(m.Text, "menu") || m.Text == "Меню" {
+        b.showMenu(m.Chat.ID, b.isBoss(m.From.ID))
+        return
+    }
     state, _ := b.DB.LoadState(ctx, m.From.ID, nil)
     switch state {
-    case StateRegName:
-        name := strings.TrimSpace(m.Text)
-        if name == "" { b.reply(m.Chat.ID, "Введите имя/ФИО текстом."); return }
-        b.DB.SaveState(ctx, m.From.ID, StateRegTeam, map[string]string{"name": name})
-        b.reply(m.Chat.ID, "Введите название команды (отдела):")
-        return
-    case StateRegTeam:
-        var payload map[string]string
-        b.DB.LoadState(ctx, m.From.ID, &payload)
-        team := strings.TrimSpace(m.Text)
-        if team == "" { b.reply(m.Chat.ID, "Введите команду текстом."); return }
-        _ = b.DB.SetWorkerProfile(ctx, m.From.ID, payload["name"], team)
+        case StateRegName:
+            name := strings.TrimSpace(m.Text)
+            if name == "" { b.reply(m.Chat.ID, "Введите имя/ФИО текстом."); return }
+            b.DB.SaveState(ctx, m.From.ID, StateRegTeam, map[string]string{"name": name})
+            b.sendDeptKeyboard(m.Chat.ID)
+            return
+        case StateRegTeam:
+            var payload map[string]string
+            b.DB.LoadState(ctx, m.From.ID, &payload)
+            team := strings.TrimSpace(m.Text)
+            if team == "" {
+                b.sendDeptKeyboard(m.Chat.ID); 
+                return 
+                }
+            _ = b.DB.SetWorkerProfile(ctx, m.From.ID, payload["name"], team)
+            b.DB.ClearState(ctx, m.From.ID)
+            b.reply(m.Chat.ID, "Готово! Вы зарегистрированы как сотрудник: "+payload["name"]+" ("+team+").")
+            return
+        case StateNewTaskTitle:
+            title := strings.TrimSpace(m.Text)
+            if title == "" { 
+                b.reply(m.Chat.ID, "Название не может быть пустым. Введите текст."); 
+                return }
+            d := &NewTaskDraft{}
+            b.DB.LoadState(ctx, m.From.ID, d)
+            d.Title = title
+            b.DB.SaveState(ctx, m.From.ID, StateNewTaskBody, d)
+            b.reply(m.Chat.ID, "Теперь отправьте содержание задачи: текст ИЛИ голосовое.")
+            return
+        case StateNewTaskBody:
+            d := &NewTaskDraft{}
+            b.DB.LoadState(ctx, m.From.ID, d)
+            if m.Text != "" { 
+                d.Description = m.Text 
+            }
+            if m.Voice != nil { 
+                d.VoiceFileID = m.Voice.FileID
+             }
+            if d.Description == "" && d.VoiceFileID == "" {
+                b.reply(m.Chat.ID, "Пришлите текст или голосовое сообщение.")
+                return
+            }
+            b.DB.SaveState(ctx, m.From.ID, StateNewTaskAssignees, d)
+            b.askAssignees(m.Chat.ID)
+            return        
+    }
+    if state == StateErrorReport {
+        txt := m.Text
+        if strings.TrimSpace(txt) == "" { b.reply(m.Chat.ID, "Нужно текстовое описание ошибки."); return }
+        b.forwardError(m.From, txt)
         b.DB.ClearState(ctx, m.From.ID)
-        b.reply(m.Chat.ID, "Готово! Вы зарегистрированы как сотрудник: "+payload["name"]+" ("+team+").")
+        b.reply(m.Chat.ID, "Спасибо! Сообщение об ошибке отправлено.")
         return
     }
-
-    if state == StateNewTaskWaitBody && b.isBoss(m.From.ID) {
-        d := &NewTaskDraft{}; b.DB.LoadState(ctx, m.From.ID, d)
-        if m.Text != "" {
-            lines := strings.SplitN(m.Text, "\n", 2)
-            if len(lines) == 1 { d.Title = lines[0]; d.Description = "" } else { d.Title = lines[0]; d.Description = lines[1] }
-        } else if m.Voice != nil {
-            d.VoiceFileID = m.Voice.FileID
-            if strings.TrimSpace(d.Title) == "" { d.Title = "Голосовое задание" }
-        } else {
-            b.reply(m.Chat.ID, "Пришлите текст или голосовое."); return
-        }
-        b.DB.SaveState(ctx, m.From.ID, StateNewTaskAssignees, d)
-        b.askAssignees(m.Chat.ID)
-        return
-    }
-
     if state == StateAwaitResult {
 		var pld struct{ TaskID int64 `json:"task_id"` }
 		if _, err := b.DB.LoadState(ctx, m.From.ID, &pld); err != nil {
@@ -168,13 +265,40 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 		 return 
 		}
 }
+    func (b *Bot) forwardError(from *tgbotapi.User, text string) {
+    log.Printf("ERROR REPORT from @%s (%d): %s", from.UserName, from.ID, text)
+    var bossID int64 = 653296078
+    msg := fmt.Sprintf("🐞 Error report от @%s (%d):\n%s", from.UserName, from.ID, text)
+    b.API.Send(tgbotapi.NewMessage(bossID, msg))
+    }
+
+func (b *Bot) sendDeptKeyboard(chatID int64) {
+    deps, _ := b.DB.ListDepartments(context.Background())
+    if len(deps)==0 {
+        b.reply(chatID, "Отделы ещё не созданы. Попросите босса выполнить /dept_add <название>.")
+        return
+    }
+    var rows [][]tgbotapi.InlineKeyboardButton
+    for _, d := range deps {
+        rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+            tgbotapi.NewInlineKeyboardButtonData(d.Name, fmt.Sprintf("choose_dept:%d", d.ID)),
+        ))
+    }
+    kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
+    msg := tgbotapi.NewMessage(chatID, "Выберите ваш отдел кнопкой:")
+    msg.ReplyMarkup = kb
+    b.API.Send(msg)
+}
+
 
 func (b *Bot) onStart(m *tgbotapi.Message) {
+    txt := "Привет! Зарегистрируйтесь как сотрудник: /register\nКоманды:\n/mytasks — мои задачи\n/teamtasks — задачи команды\n/menu — показать меню"
     if b.isBoss(m.From.ID) {
-        b.reply(m.Chat.ID, "Вы отмечены как Босс. Команды:\n/newtask — выдать задание\n/allactive — активные задачи (со статусами)\n/users — список сотрудников\n/del <tg_id> — удалить сотрудника\n/mytasks — ваши задачи (если вы исполнитель)\n/register — профиль сотрудника")
-    } else {
-        b.reply(m.Chat.ID, "Привет! Зарегистрируйтесь как сотрудник: /register\nКоманды:\n/mytasks — мои незавершённые задачи\n/teamtasks — задачи по моей команде")
+        txt = "Вы Босс. Команды:\n/newtask — выдать задание\n/allactive — активные задачи\n/users — список сотрудников\n/del <tg_id> — удалить сотрудника\n/dept_add <name> — создать отдел\n/dept_list — список отделов\n/dept_del <id> — удалить отдел\n/menu — показать меню"
     }
+    msg := tgbotapi.NewMessage(m.Chat.ID, txt)
+    msg.ReplyMarkup = menuKB                     
+    b.API.Send(msg)
 }
 
 func (b *Bot) askAssignees(chatID int64) {
@@ -284,6 +408,20 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
         taskID, _ := strconv.ParseInt(parts[1], 10, 64)
         b.onTaskAction(from.ID, cq, action, taskID)
         return
+    }
+    if strings.HasPrefix(data, "choose_dept:") {
+        depID, _ := strconv.ParseInt(strings.TrimPrefix(data, "choose_dept:"), 10, 64)
+    var p map[string]string
+    b.DB.LoadState(ctx, from.ID, &p)
+    if err := b.DB.SetWorkerTeamByDeptID(ctx, from.ID, depID); err != nil {
+        b.API.Request(tgbotapi.NewCallback(cq.ID, "Ошибка выбора отдела"))
+        return
+    }
+    b.DB.ClearState(ctx, from.ID)
+    dep, _ := b.DB.GetDepartmentByID(ctx, depID)
+    b.API.Send(tgbotapi.NewMessage(cq.Message.Chat.ID, fmt.Sprintf("Готово! %s, ваш отдел: %s.", p["name"], dep.Name)))
+    b.API.Request(tgbotapi.NewCallback(cq.ID, "Отдел выбран"))
+    return
     }
 }
 

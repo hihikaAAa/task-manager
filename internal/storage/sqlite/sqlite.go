@@ -74,6 +74,13 @@ func migrate(ctx context.Context, db *sql.DB) error {
             payload TEXT,
             updated_at DATETIME NOT NULL
         );`,
+        `CREATE TABLE IF NOT EXISTS departments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            created_at DATETIME NOT NULL,
+            created_by INTEGER
+);`,
+
     }
     for _, s := range stmts {
         if _, err := db.ExecContext(ctx, s); err != nil { return err }
