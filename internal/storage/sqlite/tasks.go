@@ -208,3 +208,14 @@ func (d *DB) SearchWorkers(ctx context.Context, q string) ([]*User, error) {
     }
     return out, nil
 }
+
+func (d *DB) HasResult(ctx context.Context, taskID, userID int64) (bool, error) {
+    row := d.SQL.QueryRowContext(ctx, `SELECT 1 FROM task_results WHERE task_id=? AND user_id=? LIMIT 1`, taskID, userID)
+    var one int
+    if err := row.Scan(&one); err != nil {
+        if err == sql.ErrNoRows { return false, nil }
+        return false, err
+    }
+    return true, nil
+}
+

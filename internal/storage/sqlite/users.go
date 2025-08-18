@@ -105,3 +105,12 @@ func (d *DB) DeleteWorkerByTgID(ctx context.Context, tgID int64) (int64, error) 
 	}
     return res.RowsAffected()
 }
+
+func (d *DB) GetUserByID(ctx context.Context, id int64) (*User, error) {
+    row := d.SQL.QueryRowContext(ctx, `SELECT id, tg_id, username, role, name, team, created_at FROM users WHERE id=?`, id)
+    u := &User{}
+    if err := row.Scan(&u.ID, &u.TgID, &u.Username, &u.Role, &u.Name, &u.Team, &u.CreatedAt); err != nil {
+        return nil, err
+    }
+    return u, nil
+}

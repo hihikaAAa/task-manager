@@ -113,25 +113,60 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
     }
 
     if state == StateAwaitResult {
-        var pld struct{ TaskID int64 `json:"task_id"` }; b.DB.LoadState(ctx, m.From.ID, &pld)
-        var text *string; var fileID *string
-        if m.Text != "" { t := m.Text; text = &t }
-        if m.Document != nil { f := m.Document.FileID; fileID = &f }
-        if m.Audio != nil { f := m.Audio.FileID; fileID = &f }
-        if m.Voice != nil { f := m.Voice.FileID; fileID = &f }
-        if text == nil && fileID == nil { b.reply(m.Chat.ID, "Пришлите текст результата или файл."); return }
-        if err := b.DB.AddResult(ctx, pld.TaskID, user.ID, text, fileID); err != nil { log.Println("add result:", err) }
-        t, _ := b.DB.GetTask(ctx, pld.TaskID)
-        msg := fmt.Sprintf("📎 Получен результат по задаче #%d от @%s", pld.TaskID, ifEmpty(user.Username.String, "user"))
-        b.API.Send(tgbotapi.NewMessage(t.CreatorID, msg))
-        if text != nil { b.API.Send(tgbotapi.NewMessage(t.CreatorID, *text)) }
-        if fileID != nil { b.API.Send(tgbotapi.NewDocument(t.CreatorID, tgbotapi.FileID(*fileID))) }
-        b.DB.ClearState(ctx, m.From.ID)
-        b.reply(m.Chat.ID, "Результат отправлен боссу. Спасибо!")
-        return
-    }
+		var pld struct{ TaskID int64 `json:"task_id"` }
+		if _, err := b.DB.LoadState(ctx, m.From.ID, &pld); err != nil {
+			log.Println("load state:", err)
+			return
+		}
 
-    if b.HandleTextFlow(m) { return }
+		var text *string
+		var fileID *string
+
+		if m.Text != "" { t := m.Text; text = &t }
+		if m.Document != nil { f := m.Document.FileID; fileID = &f }
+		if m.Audio != nil   { f := m.Audio.FileID;   fileID = &f }
+		if m.Voice != nil   { f := m.Voice.FileID;   fileID = &f }
+		if len(m.Photo) > 0 {                    
+			f := m.Photo[len(m.Photo)-1].FileID              
+			fileID = &f
+		}
+		if m.Video != nil { f := m.Video.FileID; fileID = &f }        
+
+		if text == nil && fileID == nil {
+			b.reply(m.Chat.ID, "Пришлите текст результата или файл.")
+			return
+		}
+
+		if err := b.DB.AddResult(ctx, pld.TaskID, user.ID, text, fileID); err != nil {
+			log.Println("add result:", err)
+		}
+
+		t, _ := b.DB.GetTask(ctx, pld.TaskID)
+		creator, _ := b.DB.GetUserByID(ctx, t.CreatorID)
+
+		msg := fmt.Sprintf("📎 Получен результат по задаче #%d от @%s",
+			pld.TaskID, ifEmpty(user.Username.String, "user"))
+		b.API.Send(tgbotapi.NewMessage(creator.TgID, msg))
+		if text != nil { b.API.Send(tgbotapi.NewMessage(creator.TgID, *text)) }
+		if fileID != nil { b.API.Send(tgbotapi.NewDocument(creator.TgID, tgbotapi.FileID(*fileID))) }
+
+		_ = b.DB.ClearState(ctx, m.From.ID)                       
+
+
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("✔️ Сделано", fmt.Sprintf("task_action:done:%d", pld.TaskID)),
+				tgbotapi.NewInlineKeyboardButtonData("📎 Отправить ещё", fmt.Sprintf("task_action:upload:%d", pld.TaskID)),
+			),
+		)
+		hint := tgbotapi.NewMessage(m.Chat.ID, "Результат отправлен. Теперь можно отметить задачу как выполненную.")
+		hint.ReplyMarkup = kb
+		b.API.Send(hint)
+		return
+	}
+    if b.HandleTextFlow(m) {
+		 return 
+		}
 }
 
 func (b *Bot) onStart(m *tgbotapi.Message) {
@@ -252,26 +287,36 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
     }
 }
 
-func (b *Bot) onTaskAction(userID int64, cq *tgbotapi.CallbackQuery, action string, taskID int64) {
+func (b *Bot) onTaskAction(userTgID int64, cq *tgbotapi.CallbackQuery, action string, taskID int64) {
     ctx := context.Background()
+    u, err := b.DB.GetUserByTgID(ctx, userTgID) 
+    if err != nil { b.API.Request(tgbotapi.NewCallback(cq.ID, "Профиль не найден")); return }
+
     switch action {
     case "accept":
-        _ = b.DB.UpdateAssigneeStatus(ctx, taskID, userID, "in_progress")
+        _ = b.DB.UpdateAssigneeStatus(ctx, taskID, u.ID, "in_progress")
         b.API.Request(tgbotapi.NewCallback(cq.ID, "Статус: В работе"))
     case "done":
-        _ = b.DB.UpdateAssigneeStatus(ctx, taskID, userID, "done")
+        has, _ := b.DB.HasResult(ctx, taskID, u.ID)
+        if !has {
+            b.API.Request(tgbotapi.NewCallback(cq.ID, "Сначала отправьте результат"))
+            return
+        }
+        _ = b.DB.UpdateAssigneeStatus(ctx, taskID, u.ID, "done")
         b.API.Request(tgbotapi.NewCallback(cq.ID, "Отмечено как выполнено"))
         t, _ := b.DB.GetTask(ctx, taskID)
-        b.API.Send(tgbotapi.NewMessage(t.CreatorID, fmt.Sprintf("✔️ Исполнитель @%s завершил задачу #%d", cq.From.UserName, taskID)))
+        creator, _ := b.DB.GetUserByID(ctx, t.CreatorID) 
+        b.API.Send(tgbotapi.NewMessage(creator.TgID, fmt.Sprintf("✔️ Исполнитель @%s завершил задачу #%d", cq.From.UserName, taskID)))
     case "fail":
-        _ = b.DB.UpdateAssigneeStatus(ctx, taskID, userID, "failed")
+        _ = b.DB.UpdateAssigneeStatus(ctx, taskID, u.ID, "failed")
         b.API.Request(tgbotapi.NewCallback(cq.ID, "Отмечено: не выполнено"))
     case "upload":
-        b.DB.SaveState(ctx, userID, StateAwaitResult, map[string]any{"task_id": taskID})
+        b.DB.SaveState(ctx, userTgID, StateAwaitResult, map[string]any{"task_id": taskID})
         b.API.Request(tgbotapi.NewCallback(cq.ID, "Пришлите результат сообщением или файлом"))
         b.API.Send(tgbotapi.NewMessage(cq.Message.Chat.ID, "Пришлите результат (текст/файл/голосовое)."))
     }
 }
+
 
 func (b *Bot) cmdMyTasks(m *tgbotapi.Message) {
     ctx := context.Background()
@@ -484,7 +529,6 @@ func (b *Bot) sendTaskToAssignee(tgID int64, taskID int64, t *sqlite.Task) {
     kb := tgbotapi.NewInlineKeyboardMarkup(
         tgbotapi.NewInlineKeyboardRow(
             tgbotapi.NewInlineKeyboardButtonData("🚀 В работу", fmt.Sprintf("task_action:accept:%d", taskID)),
-            tgbotapi.NewInlineKeyboardButtonData("✔️ Сделано", fmt.Sprintf("task_action:done:%d", taskID)),
         ),
         tgbotapi.NewInlineKeyboardRow(
             tgbotapi.NewInlineKeyboardButtonData("⛔ Не выполнено", fmt.Sprintf("task_action:fail:%d", taskID)),
@@ -496,4 +540,8 @@ func (b *Bot) sendTaskToAssignee(tgID int64, taskID int64, t *sqlite.Task) {
     if t.VoiceFileID.Valid { b.API.Send(tgbotapi.NewVoice(tgID, tgbotapi.FileID(t.VoiceFileID.String))) }
 }
 
-func strPtrIf(cond bool, s string) *string { if cond { return &s }; return nil }
+func strPtrIf(cond bool, s string) *string { if cond { 
+		return &s 
+	}; 
+	return nil 
+}
