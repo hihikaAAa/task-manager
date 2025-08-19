@@ -9,14 +9,23 @@ type Department struct {
     Name string
 }
 
+
 func (d *DB) CreateDepartment(ctx context.Context, name string, createdBy *int64) (int64, error) {
+    var nextID int64
+    if err := d.SQL.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0)+1 FROM departments`).Scan(&nextID); err != nil {
+        return 0, err
+    }
+
     now := Now()
     var cb interface{}
     if createdBy != nil { cb = *createdBy }
-    res, err := d.SQL.ExecContext(ctx, `INSERT INTO departments(name, created_at, created_by) VALUES(?,?,?)`, name, now, cb)
+
+    _, err := d.SQL.ExecContext(ctx,
+        `INSERT INTO departments(id, name, created_at, created_by) VALUES(?,?,?,?)`,
+        nextID, name, now, cb,
+    )
     if err != nil { return 0, err }
-    id, _ := res.LastInsertId()
-    return id, nil
+    return nextID, nil
 }
 
 func (d *DB) ListDepartments(ctx context.Context) ([]*Department, error) {
@@ -43,3 +52,4 @@ func (d *DB) DeleteDepartment(ctx context.Context, id int64) error {
     _, err := d.SQL.ExecContext(ctx, `DELETE FROM departments WHERE id=?`, id)
     return err
 }
+

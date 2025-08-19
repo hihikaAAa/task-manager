@@ -55,7 +55,7 @@ func (b *Bot) Start() error {
 func (b *Bot) showMenu(chatID int64, boss bool) {
     var txt string
     if boss {
-        txt = "Меню:\n/newtask — выдать задание\n/allactive — активные задачи\n/users — список сотрудников\n/del <tg_id> — удалить сотрудника\n/dept_add <name>\n/dept_list\n/dept_del <id>\n/mytasks — мои задачи\n/teamtasks — задачи моей команды\n/error <сообщение> — отправить ошибку боссу"
+        txt = "Меню:\n/newtask — выдать задание\n/allactive — активные задачи\n/users — список сотрудников\n/del <tg_id> — удалить сотрудника\n/dept_add <name> - добавить отдел\n/dept_list - список отделов\n/dept_del <id> - удалить отдел\n/error <сообщение> — отправить ошибку боссу"
     } else {
         txt = "Меню:\n/register — регистрация/обновить отдел\n/mytasks — мои задачи\n/teamtasks — задачи моей команды\n/error <сообщение> — отправить ошибку боссу"
     }
@@ -69,8 +69,21 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
     role := "worker"; if b.isBoss(m.From.ID) { role = "boss" }
     var username *string; if m.From.UserName != "" { u := m.From.UserName; username = &u }
     user, err := b.DB.UpsertUser(ctx, m.From.ID, username, role); if err != nil { log.Println("upsert user:", err) }
+    state, _ := b.DB.LoadState(ctx, m.From.ID, nil) 
 
+    isNewTaskState := func(s string) bool {
+        switch s {
+        case StateNewTaskTitle, StateNewTaskBody, StateNewTaskAssignees, StateNewTaskDeadline, StateNewTaskReminders:
+            return true
+        }
+        return false
+    }
     if m.IsCommand() {
+        cmd := m.Command()
+        if isNewTaskState(state) && cmd != "newtask" {
+            _ = b.DB.ClearState(ctx, m.From.ID)
+            state = "" 
+        }   
         switch m.Command() {
         case "start":
             b.onStart(m)
@@ -85,8 +98,16 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
             b.DB.SaveState(ctx, m.From.ID, StateNewTaskTitle, &NewTaskDraft{})
             b.reply(m.Chat.ID, "Введите НАЗВАНИЕ задачи (только текстом):")
         case "mytasks":
+            if b.isBoss(m.From.ID) { 
+                b.reply(m.Chat.ID, "Команда недоступна для боссов.");
+                 return
+                }
             b.cmdMyTasks(m)
         case "teamtasks":
+            if b.isBoss(m.From.ID) { 
+                b.reply(m.Chat.ID, "Команда недоступна для боссов.");
+                return 
+            }
             b.cmdTeamTasks(m)
         case "allactive":
             if !b.isBoss(m.From.ID) { b.reply(m.Chat.ID, "Только для боссов."); return }
@@ -104,7 +125,7 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
             if !b.isBoss(m.From.ID) { b.reply(m.Chat.ID, "Только для боссов."); return }
             name := strings.TrimSpace(m.CommandArguments())
             if name == "" { 
-                b.reply(m.Chat.ID, "Использование: /dept_add <название>");
+                b.reply(m.Chat.ID, "Добавление отдела:\n/dept_add <название>\nНапример: /dept_add Маркетинг");
                  return
                  }
             _, err := b.DB.CreateDepartment(ctx, name, nil)
@@ -117,13 +138,13 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
             if !b.isBoss(m.From.ID) { b.reply(m.Chat.ID, "Только для боссов."); return }
             deps, _ := b.DB.ListDepartments(ctx)
             if len(deps)==0 { 
-                b.reply(m.Chat.ID, "Отделов нет.");
+                b.reply(m.Chat.ID, "Отделов пока нет.\nДобавьте: /dept_add <название>");
                  return 
                 }
             var sb strings.Builder
-            sb.WriteString("Отделы:\n")
+            sb.WriteString("Отделы (id → название):\n")
             for _, d := range deps { sb.WriteString(fmt.Sprintf("- [%d] %s\n", d.ID, d.Name)) }
-            sb.WriteString("\nУдалить: /dept_del <id>")
+            sb.WriteString("\nКоманды:\n• /dept_add <название> — создать отдел\n• /dept_del <id> — удалить отдел")
             b.reply(m.Chat.ID, sb.String())
         case "dept_del":
             if !b.isBoss(m.From.ID) { 
@@ -131,6 +152,10 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
                 return 
             }
             idStr := strings.TrimSpace(m.CommandArguments())
+            if idStr == "" {
+                b.reply(m.Chat.ID, "Удаление отдела:\n/dept_del <id>\nСписок id: /dept_list")
+                return
+            }       
             id, err := strconv.ParseInt(idStr, 10, 64); if err != nil { b.reply(m.Chat.ID, "id должен быть числом"); return }
             if err := b.DB.DeleteDepartment(ctx, id); err != nil { b.reply(m.Chat.ID, "Ошибка: "+err.Error()); return }
             b.reply(m.Chat.ID, "Отдел удалён.")
@@ -153,7 +178,7 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
         b.showMenu(m.Chat.ID, b.isBoss(m.From.ID))
         return
     }
-    state, _ := b.DB.LoadState(ctx, m.From.ID, nil)
+    state, _ = b.DB.LoadState(ctx, m.From.ID, nil)
     switch state {
         case StateRegName:
             name := strings.TrimSpace(m.Text)
