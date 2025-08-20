@@ -130,23 +130,37 @@ func (d *DB) GetUserByID(ctx context.Context, id int64) (*User, error) {
 
 func (d *DB) ListDoneExecutorsForTask(ctx context.Context, taskID int64) ([]*AssigneeWithUser, error) {
 	rows, err := d.SQL.QueryContext(ctx, `
-		SELECT ta.user_id, ta.status, u.name, u.username, u.team
+		SELECT ta.user_id, ta.status, u.name, u.username, u.team, u.tg_id
 		FROM task_assignees ta
 		LEFT JOIN users u ON u.id = ta.user_id
 		WHERE ta.task_id = ? AND ta.status='done'
 		ORDER BY ta.updated_at DESC`, taskID)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 	defer rows.Close()
 
 	var out []*AssigneeWithUser
 	for rows.Next() {
 		r := &AssigneeWithUser{}
-		if err := rows.Scan(&r.UserID, &r.Status, &r.Name, &r.Username, &r.Team); err != nil {
+		if err := rows.Scan(&r.UserID, &r.Status, &r.Name, &r.Username, &r.Team, &r.TgID); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+func (d *DB) ListAssigneeTgIDsByTask(ctx context.Context, taskID int64) ([]int64, error) {
+	rows, err := d.SQL.QueryContext(ctx, `
+		SELECT u.tg_id
+		FROM task_assignees ta JOIN users u ON u.id = ta.user_id
+		WHERE ta.task_id = ?`, taskID)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var tg int64
+		if err := rows.Scan(&tg); err != nil { return nil, err }
+		ids = append(ids, tg)
+	}
+	return ids, nil
 }

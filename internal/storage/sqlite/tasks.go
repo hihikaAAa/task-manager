@@ -40,6 +40,7 @@ type AssigneeWithUser struct {
 	Name     sql.NullString
 	Username sql.NullString
 	Team     sql.NullString
+	TgID     sql.NullInt64
 }
 
 func (d *DB) CreateTask(ctx context.Context, t *Task, assigneeIDs []int64) (int64, error) {
@@ -84,7 +85,7 @@ func (d *DB) ListActiveTasksForBoss(ctx context.Context) ([]*Task, error) {
 		LEFT JOIN task_assignees ta ON ta.task_id = t.id
 		GROUP BY t.id
 		HAVING COUNT(ta.id)=0
-		   OR SUM(CASE WHEN ta.status!='done' THEN 1 ELSE 0 END)>0
+		   OR SUM(CASE WHEN ta.status!='done' THEN 1 ELSE 0 END) > 0
 		ORDER BY t.created_at DESC`)
 	if err != nil { return nil, err }
 	defer rows.Close()
@@ -263,8 +264,6 @@ func (d *DB) ListDoneTasksForBoss(ctx context.Context, limit int) ([]*Task, []ti
 	return ts, comps, nil
 }
 
-
-
 func (d *DB) ListDoneTasksForUser(ctx context.Context, userID int64, limit int) ([]*Task, []time.Time, error) {
 	rows, err := d.SQL.QueryContext(ctx, `
 		SELECT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at, t.created_at, t.updated_at,
@@ -312,20 +311,18 @@ func (d *DB) ListTasksWithoutAssignees(ctx context.Context) ([]*Task, error) {
 
 func (d *DB) ListAssigneesWithUsersAny(ctx context.Context, taskID int64) ([]*AssigneeWithUser, error) {
 	rows, err := d.SQL.QueryContext(ctx, `
-		SELECT ta.user_id, ta.status, u.name, u.username, u.team
+		SELECT ta.user_id, ta.status, u.name, u.username, u.team, u.tg_id
 		FROM task_assignees ta
 		LEFT JOIN users u ON u.id = ta.user_id
 		WHERE ta.task_id = ?
 		ORDER BY COALESCE(u.name, u.username)`, taskID)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 	defer rows.Close()
 
 	var out []*AssigneeWithUser
 	for rows.Next() {
 		r := &AssigneeWithUser{}
-		if err := rows.Scan(&r.UserID, &r.Status, &r.Name, &r.Username, &r.Team); err != nil {
+		if err := rows.Scan(&r.UserID, &r.Status, &r.Name, &r.Username, &r.Team, &r.TgID); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -336,9 +333,37 @@ func (d *DB) ListAssigneesWithUsersAny(ctx context.Context, taskID int64) ([]*As
 func (d *DB) IsAssigneeDone(ctx context.Context, taskID, userID int64) (bool, error) {
 	var st string
 	err := d.SQL.QueryRowContext(ctx,
-		`SELECT status FROM task_assignees WHERE task_id=? AND user_id=?`,
-		taskID, userID).Scan(&st)
+		`SELECT status FROM task_assignees WHERE task_id=? AND user_id=?`, taskID, userID).Scan(&st)
 	if err == sql.ErrNoRows { return false, nil }
 	if err != nil { return false, err }
 	return st == "done", nil
+}
+
+func (d *DB) ListAllTasks(ctx context.Context) ([]*Task, error) {
+	rows, err := d.SQL.QueryContext(ctx, `
+		SELECT id, creator_id, title, description, voice_file_id, due_at, created_at, updated_at
+		FROM tasks ORDER BY id`)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var out []*Task
+	for rows.Next() {
+		t := &Task{}
+		if err := rows.Scan(&t.ID,&t.CreatorID,&t.Title,&t.Description,&t.VoiceFileID,&t.DueAt,&t.CreatedAt,&t.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, nil
+}
+
+func (d *DB) DeleteTask(ctx context.Context, taskID int64) (int64, error) {
+	res, err := d.SQL.ExecContext(ctx, `DELETE FROM tasks WHERE id=?`, taskID)
+	if err != nil { return 0, err }
+	return res.RowsAffected()
+}
+
+func (d *DB) DeleteAllTasks(ctx context.Context) (int64, error) {
+	res, err := d.SQL.ExecContext(ctx, `DELETE FROM tasks`)
+	if err != nil { return 0, err }
+	return res.RowsAffected()
 }

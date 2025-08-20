@@ -239,6 +239,12 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
         case "mydone":
             if b.isBoss(m.From.ID) { b.reply(m.Chat.ID, "Команда недоступна для боссов."); return }
             b.cmdMyDone(m)
+        case "task_del":
+	        if !b.isBoss(m.From.ID) { b.reply(m.Chat.ID, "Только для боссов."); return }
+	        b.cmdTaskDel(m)
+        case "task_del_all":
+	        if !b.isBoss(m.From.ID) { b.reply(m.Chat.ID, "Только для боссов."); return }
+	        b.cmdTaskDelAll(m)
 
         default:
             b.reply(m.Chat.ID, "Неизвестная команда.")
@@ -424,19 +430,31 @@ func (b *Bot) onStart(m *tgbotapi.Message) {
 }
 
 func (b *Bot) askAssignees(chatID int64) {
-    ctx := context.Background()
-    teams, _ := b.DB.ListTeams(ctx)
-    var rows [][]tgbotapi.InlineKeyboardButton
-    for _, t := range teams {
-        rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Команда: "+t, "pick_team:"+t)))
-    }
-    rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Выбрать по людям", "pick_people")))
-    rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Далее ▶", "assignees_next")))
-    kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
-    msg := tgbotapi.NewMessage(chatID, "Выберите исполнителей: можно выбирать команды и отдельных людей. Нажмите «Далее», когда закончите.")
-    msg.ReplyMarkup = kb
-    b.API.Send(msg)
+	ctx := context.Background()
+	teams, _ := b.DB.ListTeams(ctx)
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for _, t := range teams {
+		rows = append(rows,
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Отделом: "+t, "assign_team:"+t),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Выбрать по людям («"+t+"»)", "pick_team:"+t),
+			),
+		)
+	}
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("Выбрать из всех сотрудников", "pick_people"),
+	))
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("Далее ▶", "assignees_next"),
+	))
+	kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
+	msg := tgbotapi.NewMessage(chatID, "Выберите исполнителей: можно выдать сразу на весь отдел или выбрать конкретных людей. Нажмите «Далее», чтобы продолжить.")
+	msg.ReplyMarkup = kb
+	b.API.Send(msg)
 }
+
 
 func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
     ctx := context.Background()
@@ -571,6 +589,23 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
     b.API.Request(tgbotapi.NewCallback(cq.ID, "Отдел выбран"))
     return
 }
+    if strings.HasPrefix(data, "assign_team:") {
+	team := strings.TrimPrefix(data, "assign_team:")
+	workers, _ := b.DB.ListWorkersByTeam(ctx, team)
+	var tgIDs []int64
+	for _, w := range workers { tgIDs = append(tgIDs, w.TgID) }
+
+	d := &NewTaskDraft{}; b.DB.LoadState(ctx, from.ID, d)
+	d.AssigneeIDs = uniqAppend(d.AssigneeIDs, tgIDs...)
+	b.DB.SaveState(ctx, from.ID, StateNewTaskDeadline, d)
+
+	msg := tgbotapi.NewMessage(cq.Message.Chat.ID,
+		fmt.Sprintf("Назначено отделу «%s» (%d сотрудн.). Введите дедлайн в формате DD.MM.YYYY HH:MM.", team, len(tgIDs)))
+	b.API.Send(msg)
+	b.API.Request(tgbotapi.NewCallback(cq.ID, "Назначено отделу"))
+	return
+}
+
 }
 
 func (b *Bot) onTaskAction(userTgID int64, cq *tgbotapi.CallbackQuery, action string, taskID int64) {
@@ -873,7 +908,6 @@ func (b *Bot) cmdDone(m *tgbotapi.Message) {
 	ctx := context.Background()
 	ts, comps, err := b.DB.ListDoneTasksForBoss(ctx, 30)
 	if err != nil || len(ts) == 0 { b.reply(m.Chat.ID, "Выполненных задач пока нет."); return }
-
 	var sb strings.Builder
 	sb.WriteString("Выполненные задачи:\n")
 	for i, t := range ts {
@@ -935,5 +969,54 @@ func (b *Bot) pingOrphans() {
         msg := tgbotapi.NewMessage(bossID, sb.String())
         b.API.Send(msg)
     }
+}
+
+func (b *Bot) cmdTaskDel(m *tgbotapi.Message) {
+	ctx := context.Background()
+	args := strings.TrimSpace(m.CommandArguments())
+	if args == "" { b.reply(m.Chat.ID, "Использование: /task_del <id>"); return }
+	taskID, err := strconv.ParseInt(args, 10, 64)
+	if err != nil { b.reply(m.Chat.ID, "id должен быть числом"); return }
+
+	t, err := b.DB.GetTask(ctx, taskID)
+	if err != nil { b.reply(m.Chat.ID, "Задача не найдена."); return }
+	tgIDs, _ := b.DB.ListAssigneeTgIDsByTask(ctx, taskID)
+
+	aff, err := b.DB.DeleteTask(ctx, taskID)
+	if err != nil || aff == 0 { b.reply(m.Chat.ID, "Не удалось удалить."); return }
+
+	title := nullStr(t.Title)
+	for _, tg := range tgIDs {
+		b.API.Send(tgbotapi.NewMessage(tg, "❌ Задача «"+title+"» удалена боссом."))
+	}
+	b.reply(m.Chat.ID, "Удалено.")
+}
+
+func (b *Bot) cmdTaskDelAll(m *tgbotapi.Message) {
+	ctx := context.Background()
+
+	tasks, _ := b.DB.ListAllTasks(ctx)
+	for _, t := range tasks {
+		title := nullStr(t.Title)
+		tgIDs, _ := b.DB.ListAssigneeTgIDsByTask(ctx, t.ID)
+		for _, tg := range tgIDs {
+			b.API.Send(tgbotapi.NewMessage(tg, "❌ Задача «"+title+"» удалена боссом."))
+		}
+	}
+	aff, err := b.DB.DeleteAllTasks(ctx)
+	if err != nil {
+		b.reply(m.Chat.ID, "Ошибка: "+err.Error())
+		return
+	}
+	b.reply(m.Chat.ID, fmt.Sprintf("Удалено задач: %d", aff))
+}
+
+func uniqAppend(dst []int64, more ...int64) []int64 {
+	set := make(map[int64]struct{}, len(dst)+len(more))
+	for _, v := range dst { set[v] = struct{}{} }
+	for _, v := range more {
+		if _, ok := set[v]; !ok { dst = append(dst, v); set[v] = struct{}{} }
+	}
+	return dst
 }
 
