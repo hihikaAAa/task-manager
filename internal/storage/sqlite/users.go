@@ -106,12 +106,18 @@ func (d *DB) FindWorkerByUsername(ctx context.Context, username string) (*User, 
 }
 
 func (d *DB) DeleteWorkerByTgID(ctx context.Context, tgID int64) (int64, error) {
+    u, err := d.GetUserByTgID(ctx, tgID)
+    if err != nil { return 0, err }
+
+    _, _ = d.SQL.ExecContext(ctx, `UPDATE task_assignees SET user_id=NULL WHERE user_id=?`, u.ID)
+    _, _ = d.SQL.ExecContext(ctx, `DELETE FROM reminders WHERE user_id=?`, u.ID)
+
     res, err := d.SQL.ExecContext(ctx, `DELETE FROM users WHERE tg_id=? AND role='worker'`, tgID)
-    if err != nil { 
-		return 0, err 
-	}
-    return res.RowsAffected()
+    if err != nil { return 0, err }
+    n, _ := res.RowsAffected()
+    return n, nil
 }
+
 
 func (d *DB) GetUserByID(ctx context.Context, id int64) (*User, error) {
     row := d.SQL.QueryRowContext(ctx, `SELECT id, tg_id, username, role, name, team, created_at FROM users WHERE id=?`, id)

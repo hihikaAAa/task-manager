@@ -45,6 +45,10 @@ func (b *Bot) Start() error {
     upd := tgbotapi.NewUpdate(0)
     upd.Timeout = 30
     updates := b.API.GetUpdatesChan(upd)
+
+    b.startOrphansDailyPing(10) 
+    b.startRemindersLoop()       
+
     for update := range updates {
         if update.Message != nil { go b.handleMessage(update.Message) }
         if update.CallbackQuery != nil { go b.handleCallback(update.CallbackQuery) }
@@ -52,12 +56,66 @@ func (b *Bot) Start() error {
     return nil
 }
 
+func (b *Bot) startRemindersLoop() {
+    go func() {
+        ticker := time.NewTicker(30 * time.Second)
+        defer ticker.Stop()
+        for range ticker.C {
+            b.dispatchReminders()
+        }
+    }()
+}
+
+func (b *Bot) dispatchReminders() {
+    ctx := context.Background()
+    due := time.Now().In(b.TZ)
+    rs, err := b.DB.ListDueReminders(ctx, due)
+    if err != nil || len(rs) == 0 { return }
+
+    for _, r := range rs {
+        t, err := b.DB.GetTask(ctx, r.TaskID); if err != nil { _ = b.DB.MarkReminderSent(ctx, r.ID); continue }
+        title := nullStr(t.Title)
+
+        send := func(chatID int64, txt string) {
+            _, _ = b.API.Send(tgbotapi.NewMessage(chatID, txt))
+        }
+
+        switch r.Kind {
+        case "before", "deadline":
+            if r.UserID.Valid {
+                u, err := b.DB.GetUserByID(ctx, r.UserID.Int64)
+                if err == nil {
+                    if r.Kind == "before" {
+                        send(u.TgID, "⏰ Напоминание: задача «"+title+"» скоро дедлайн.")
+                    } else {
+                        send(u.TgID, "⌛ Дедлайн по задаче «"+title+"». Обновите статус или отправьте результат.")
+                    }
+                }
+            }
+        case "overdue":
+            if r.UserID.Valid {
+                u, err := b.DB.GetUserByID(ctx, r.UserID.Int64)
+                if err == nil {
+                    send(u.TgID, "❗ Просрочено: задача «"+title+"».")
+                }
+            }
+            creator, err := b.DB.GetUserByID(ctx, t.CreatorID)
+            if err == nil {
+                send(creator.TgID, "❗ Просрочена задача «"+title+"». Проверьте статус.")
+            }
+        }
+
+        _ = b.DB.MarkReminderSent(ctx, r.ID)
+    }
+}
+
+
 func (b *Bot) showMenu(chatID int64, boss bool) {
     var txt string
     if boss {
-        txt = "Меню:\n/newtask — выдать задание\n/allactive — активные задачи\n/users — список сотрудников\n/del <tg_id> — удалить сотрудника\n/dept_add <name> - добавить отдел\n/dept_list - список отделов\n/dept_del <id> - удалить отдел\n/error <сообщение> — отправить ошибку боссу"
+        txt = "Меню:\n/newtask — выдать задание\n/allactive — активные задачи\n/users — список сотрудников\n/del <tg_id> — удалить сотрудника\n/dept_add <name> - добавить отдел\n/dept_list - список отделов\n/dept_del <id> - удалить отдел\n/done — выполненные задачи\n/error <сообщение> — отправить ошибку боссу"
     } else {
-        txt = "Меню:\n/register — регистрация/обновить отдел\n/mytasks — мои задачи\n/teamtasks — задачи моей команды\n/error <сообщение> — отправить ошибку боссу"
+        txt = "Меню:\n/register — регистрация/обновить отдел\n/mytasks — мои задачи\n/teamtasks — задачи моей команды\n/mydone — мои выполненные задачи\n/error <сообщение> — отправить ошибку боссу"
     }
     msg := tgbotapi.NewMessage(chatID, txt)
     msg.ReplyMarkup = menuKB
@@ -194,16 +252,7 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
             b.sendDeptKeyboard(m.Chat.ID)
             return
         case StateRegTeam:
-            var payload map[string]string
-            b.DB.LoadState(ctx, m.From.ID, &payload)
-            team := strings.TrimSpace(m.Text)
-            if team == "" {
-                b.sendDeptKeyboard(m.Chat.ID); 
-                return 
-                }
-            _ = b.DB.SetWorkerProfile(ctx, m.From.ID, payload["name"], team)
-            b.DB.ClearState(ctx, m.From.ID)
-            b.reply(m.Chat.ID, "Готово! Вы зарегистрированы как сотрудник: "+payload["name"]+" ("+team+").")
+            b.sendDeptKeyboard(m.Chat.ID)
             return
         case StateNewTaskTitle:
             title := strings.TrimSpace(m.Text)
@@ -548,7 +597,8 @@ func (b *Bot) onTaskAction(userTgID int64, cq *tgbotapi.CallbackQuery, action st
         msg := fmt.Sprintf("✔️ Исполнитель %s %s завершил задачу «%s»",
             strings.TrimSpace(name), strings.TrimSpace(tag), nullStr(t.Title))
         b.API.Send(tgbotapi.NewMessage(creator.TgID, msg))
-
+        b.API.Send(tgbotapi.NewMessage(cq.Message.Chat.ID, "Готово!"))
+        b.showMenu(cq.Message.Chat.ID, false)
     case "fail":
         _,_ = b.DB.UpdateAssigneeStatus(ctx, taskID, u.ID, "failed")
         b.API.Request(tgbotapi.NewCallback(cq.ID, "Отмечено: не выполнено"))
@@ -582,19 +632,21 @@ func (b *Bot) cmdAllActive(m *tgbotapi.Message) {
     ctx := context.Background()
     ts, err := b.DB.ListActiveTasksForBoss(ctx)
     if err != nil || len(ts) == 0 { b.reply(m.Chat.ID, "Нет активных задач."); return }
+
     var out strings.Builder
     for _, t := range ts {
-        out.WriteString(fmt.Sprintf("• #%d %s\n", t.ID, nullStr(t.Title)))
+        out.WriteString(fmt.Sprintf("• «%s»\n", nullStr(t.Title))) // было: • #%d %s
         if t.DueAt.Valid { out.WriteString("  Дедлайн: "+t.DueAt.Time.Format("02.01.2006 15:04")+"\n") }
         ass, _ := b.DB.ListAssigneesWithUsers(ctx, t.ID)
         for _, a := range ass {
             out.WriteString(fmt.Sprintf("  - %s @%s [%s]: %s\n",
-            nullStr(a.Name), nullStr(a.Username), nullStr(a.Team), mapStatus(a.Status)))
+                nullStr(a.Name), nullStr(a.Username), nullStr(a.Team), mapStatus(a.Status)))
         }
         out.WriteString("\n")
     }
     b.reply(m.Chat.ID, out.String())
 }
+
 
 func (b *Bot) cmdUsers(m *tgbotapi.Message) {
     ctx := context.Background()
@@ -618,15 +670,13 @@ func (b *Bot) cmdDeleteUser(m *tgbotapi.Message) {
     n, err := b.DB.DeleteWorkerByTgID(context.Background(), tgID)
     if err != nil { b.reply(m.Chat.ID, "Ошибка: "+err.Error()); return }
     if n == 0 { b.reply(m.Chat.ID, "Сотрудник не найден или не worker."); return }
-    b.reply(m.Chat.ID, "Удалён. Связанные напоминания и назначения также удалены.")
+    b.reply(m.Chat.ID, "Сотрудник удалён. Его напоминания удалены, задачи остались без исполнителя.")
 }
 
 func (b *Bot) formatTasks(ts []*sqlite.Task, withAssignees bool) string {
     var bld strings.Builder
     for _, t := range ts {
         bld.WriteString(fmt.Sprintf("• %s\n", nullStr(t.Title)))
-// дедлайн как был
-
         if t.DueAt.Valid { bld.WriteString("Дедлайн: "+t.DueAt.Time.Format("02.01.2006 15:04")+"\n") }
         if withAssignees {
             ass, _ := b.DB.ListAssigneesWithUsers(context.Background(), t.ID)
@@ -750,15 +800,24 @@ func (b *Bot) createTaskFromDraft(chatID, bossTgID int64, d *NewTaskDraft) {
     if err != nil { b.reply(chatID, "Ошибка создания задачи: "+err.Error()); return }
 
     if due.Valid {
-        var beforeTimes []time.Time
-        for _, h := range d.RemindHours {
-            beforeTimes = append(beforeTimes, due.Time.Add(-time.Duration(h)*time.Hour))
-        }
-        if len(beforeTimes) > 0 { _ = b.DB.CreateReminders(ctx, id, uids, beforeTimes, "before") }
+    now := time.Now().In(b.TZ).Add(5 * time.Second)
+
+    var beforeTimes []time.Time
+    for _, h := range d.RemindHours {
+        t := due.Time.Add(-time.Duration(h) * time.Hour)
+        if t.After(now) { beforeTimes = append(beforeTimes, t) } 
+    }
+    if len(beforeTimes) > 0 { _ = b.DB.CreateReminders(ctx, id, uids, beforeTimes, "before") }
+
+    if due.Time.After(now) {
         _ = b.DB.CreateReminders(ctx, id, uids, []time.Time{due.Time}, "deadline")
-        ov := due.Time.Add(30 * time.Minute)
+    }
+    ov := due.Time.Add(30 * time.Minute)
+    if ov.After(now) {
         _ = b.DB.CreateReminders(ctx, id, uids, []time.Time{ov}, "overdue")
     }
+}
+
 
     for _, tg := range d.AssigneeIDs { b.sendTaskToAssignee(tg, id, task) }
     b.reply(chatID, fmt.Sprintf("Задача «%s» создана и отправлена %d исполнителям.",
@@ -769,7 +828,6 @@ func (b *Bot) createTaskFromDraft(chatID, bossTgID int64, d *NewTaskDraft) {
 func (b *Bot) sendTaskToAssignee(tgID int64, taskID int64, t *sqlite.Task) {
     var text strings.Builder
     fmt.Fprintf(&text, "Задача «%s»\n", nullStr(t.Title))
-    if t.Title.Valid { text.WriteString("\n"+t.Title.String+"\n") }
     if t.Description.Valid { text.WriteString("\n"+t.Description.String+"\n") }
     if t.DueAt.Valid { text.WriteString("\nДедлайн: "+t.DueAt.Time.Format("02.01.2006 15:04")+"\n") }
     kb := tgbotapi.NewInlineKeyboardMarkup(
@@ -825,3 +883,31 @@ func (b *Bot) cmdMyDone(m *tgbotapi.Message) {
     b.reply(m.Chat.ID, sb.String())
 }
 
+
+func (b *Bot) startOrphansDailyPing(hour int) {
+    go func() {
+        for {
+            now := time.Now().In(b.TZ)
+            next := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, b.TZ)
+            if !now.Before(next) { next = next.Add(24 * time.Hour) }
+            time.Sleep(next.Sub(now))
+            b.pingOrphans()
+        }
+    }()
+}
+
+func (b *Bot) pingOrphans() {
+    ctx := context.Background()
+    ts, err := b.DB.ListTasksWithoutAssignees(ctx)
+    if err != nil || len(ts) == 0 { return }
+
+    var sb strings.Builder
+    sb.WriteString("⚠️ Есть задачи без исполнителей. Проверьте назначения:\n")
+    for _, t := range ts {
+        sb.WriteString("• «" + nullStr(t.Title) + "»\n")
+    }
+    for bossID := range b.BossIDs {
+        msg := tgbotapi.NewMessage(bossID, sb.String())
+        b.API.Send(msg)
+    }
+}

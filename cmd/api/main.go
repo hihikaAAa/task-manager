@@ -39,8 +39,6 @@ func main() {
     }
 
     bot := lib.NewBot(botAPI, db, cfg.BossIDs, loc)
-    rem := &lib.ReminderWorker{DB: db, Bot: botAPI}
-    rem.Start()
 
     log.Printf("Bot started as @%s with config %s", botAPI.Self.UserName, cfgPath)
     if err := bot.Start(); err != nil { 

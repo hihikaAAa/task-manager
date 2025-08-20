@@ -70,23 +70,28 @@ func (d *DB) GetTask(ctx context.Context, id int64) (*Task, error) {
 }
 
 func (d *DB) ListActiveTasksForBoss(ctx context.Context) ([]*Task, error) {
-    rows, err := d.SQL.QueryContext(ctx, `
-        SELECT DISTINCT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at, t.created_at, t.updated_at
-        FROM tasks t
-        JOIN task_assignees ta ON ta.task_id = t.id
-        WHERE ta.status != 'done'
-        ORDER BY t.created_at DESC
-    `)
-    if err != nil { return nil, err }
-    defer rows.Close()
-    var out []*Task
-    for rows.Next() {
-        t := &Task{}
-        if err := rows.Scan(&t.ID, &t.CreatorID, &t.Title, &t.Description, &t.VoiceFileID, &t.DueAt, &t.CreatedAt, &t.UpdatedAt); err != nil { return nil, err }
-        out = append(out, t)
-    }
-    return out, nil
+	rows, err := d.SQL.QueryContext(ctx, `
+		SELECT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at, t.created_at, t.updated_at
+		FROM tasks t
+		LEFT JOIN task_assignees ta ON ta.task_id = t.id
+		GROUP BY t.id
+		HAVING COUNT(ta.id)=0
+		   OR SUM(CASE WHEN ta.status!='done' THEN 1 ELSE 0 END)>0
+		ORDER BY t.created_at DESC`)
+	if err != nil { return nil, err }
+	defer rows.Close()
+
+	var out []*Task
+	for rows.Next() {
+		t := &Task{}
+		if err := rows.Scan(&t.ID,&t.CreatorID,&t.Title,&t.Description,&t.VoiceFileID,&t.DueAt,&t.CreatedAt,&t.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, nil
 }
+
 
 func (d *DB) ListActiveTasksForUser(ctx context.Context, userID int64) ([]*Task, error) {
     rows, err := d.SQL.QueryContext(ctx, `
@@ -226,30 +231,32 @@ func (d *DB) HasResult(ctx context.Context, taskID, userID int64) (bool, error) 
     return true, nil
 }
 
-// Список задач, где все исполнители = done. Возвращаем completion = MAX(ta.updated_at).
 func (d *DB) ListDoneTasksForBoss(ctx context.Context, limit int) ([]*Task, []time.Time, error) {
-    rows, err := d.SQL.QueryContext(ctx, `
-        SELECT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at, t.created_at, t.updated_at,
-               MAX(ta.updated_at) as completed_at
-        FROM tasks t
-        JOIN task_assignees ta ON ta.task_id = t.id
-        GROUP BY t.id
-        HAVING SUM(CASE WHEN ta.status='done' THEN 0 ELSE 1 END)=0
-        ORDER BY completed_at DESC
-        LIMIT ?`, limit)
-    if err != nil { return nil, nil, err }
-    defer rows.Close()
-    var ts []*Task
-    var comps []time.Time
-    for rows.Next() {
-        t := &Task{}; var comp time.Time
-        if err := rows.Scan(&t.ID,&t.CreatorID,&t.Title,&t.Description,&t.VoiceFileID,&t.DueAt,&t.CreatedAt,&t.UpdatedAt,&comp); err != nil { return nil,nil,err }
-        ts = append(ts, t); comps = append(comps, comp)
-    }
-    return ts, comps, nil
+	rows, err := d.SQL.QueryContext(ctx, `
+		SELECT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at, t.created_at, t.updated_at,
+		       MAX(ta.updated_at) AS completed_at
+		FROM tasks t
+		JOIN task_assignees ta ON ta.task_id = t.id
+		WHERE ta.status='done'
+		GROUP BY t.id
+		ORDER BY completed_at DESC
+		LIMIT ?`, limit)
+	if err != nil { return nil, nil, err }
+	defer rows.Close()
+
+	var ts []*Task; var comps []time.Time
+	for rows.Next() {
+		t := &Task{}; var comp time.Time
+		if err := rows.Scan(&t.ID,&t.CreatorID,&t.Title,&t.Description,&t.VoiceFileID,&t.DueAt,&t.CreatedAt,&t.UpdatedAt,&comp); err != nil {
+			return nil, nil, err
+		}
+		ts = append(ts, t); comps = append(comps, comp)
+	}
+	return ts, comps, nil
 }
 
-// Список выполненных задач конкретного исполнителя.
+
+
 func (d *DB) ListDoneTasksForUser(ctx context.Context, userID int64, limit int) ([]*Task, []time.Time, error) {
     rows, err := d.SQL.QueryContext(ctx, `
         SELECT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at, t.created_at, t.updated_at,
@@ -269,4 +276,27 @@ func (d *DB) ListDoneTasksForUser(ctx context.Context, userID int64, limit int) 
     }
     return ts, comps, nil
 }
+
+func (d *DB) ListTasksWithoutAssignees(ctx context.Context) ([]*Task, error) {
+    rows, err := d.SQL.QueryContext(ctx, `
+        SELECT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at, t.created_at, t.updated_at
+        FROM tasks t
+        LEFT JOIN task_assignees ta ON ta.task_id = t.id
+        GROUP BY t.id
+        HAVING COUNT(ta.id)=0
+        ORDER BY t.created_at DESC`)
+    if err != nil { return nil, err }
+    defer rows.Close()
+
+    var out []*Task
+    for rows.Next() {
+        t := &Task{}
+        if err := rows.Scan(&t.ID,&t.CreatorID,&t.Title,&t.Description,&t.VoiceFileID,&t.DueAt,&t.CreatedAt,&t.UpdatedAt); err != nil {
+            return nil, err
+        }
+        out = append(out, t)
+    }
+    return out, nil
+}
+
 
