@@ -43,3 +43,10 @@ func (d *DB) MarkReminderSent(ctx context.Context, id int64) error {
 	_, err := d.SQL.ExecContext(ctx, `UPDATE reminders SET sent=1 WHERE id=?`, id)
 	return err
 }
+func (d *DB) MarkAllRemindersSentFor(ctx context.Context, taskID, userID int64) error {
+    _, err := d.SQL.ExecContext(ctx, `
+        UPDATE reminders SET sent=1
+        WHERE task_id=? AND user_id=? AND sent=0
+    `, taskID, userID)
+    return err
+}

@@ -19,6 +19,7 @@ type NewTaskDraft struct {
     Description string   `json:"description"`
     VoiceFileID string   `json:"voice_file_id"`
     AssigneeIDs []int64  `json:"assignee_ids"`
+    DeptIDs []int64      `json:"dept_ids"`
     DueAt       string   `json:"due_at"`
     RemindHours []int    `json:"remind_hours"`
     TaskID      int64    `json:"task_id"`

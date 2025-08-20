@@ -240,29 +240,35 @@ func (d *DB) HasResult(ctx context.Context, taskID, userID int64) (bool, error) 
     return true, nil
 }
 
-func (d *DB) ListDoneTasksForBoss(ctx context.Context, limit int) ([]*Task, []time.Time, error) {
+// sqlite/tasks.go
+func (d *DB) ListDoneTasksForBoss(ctx context.Context, creatorID int64, limit int) ([]*Task, []time.Time, error) {
 	rows, err := d.SQL.QueryContext(ctx, `
-		SELECT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at, t.created_at, t.updated_at,
+		SELECT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at,
+		       t.created_at, t.updated_at,
 		       MAX(ta.updated_at) AS completed_at
 		FROM tasks t
-		JOIN task_assignees ta ON ta.task_id = t.id
-		WHERE ta.status='done'
+		JOIN task_assignees ta ON ta.task_id = t.id AND ta.status='done'
+		WHERE t.creator_id = ?                         -- << ключевой фильтр по автору
 		GROUP BY t.id
 		ORDER BY completed_at DESC
-		LIMIT ?`, limit)
+		LIMIT ?`, creatorID, limit)
 	if err != nil { return nil, nil, err }
 	defer rows.Close()
 
-	var ts []*Task; var comps []time.Time
+	var ts []*Task
+	var comps []time.Time
 	for rows.Next() {
-		t := &Task{}; var comp time.Time
+		t := &Task{}
+		var comp time.Time
 		if err := rows.Scan(&t.ID,&t.CreatorID,&t.Title,&t.Description,&t.VoiceFileID,&t.DueAt,&t.CreatedAt,&t.UpdatedAt,&comp); err != nil {
 			return nil, nil, err
 		}
-		ts = append(ts, t); comps = append(comps, comp)
+		ts = append(ts, t)
+		comps = append(comps, comp)
 	}
 	return ts, comps, nil
 }
+
 
 func (d *DB) ListDoneTasksForUser(ctx context.Context, userID int64, limit int) ([]*Task, []time.Time, error) {
 	rows, err := d.SQL.QueryContext(ctx, `
@@ -366,4 +372,51 @@ func (d *DB) DeleteAllTasks(ctx context.Context) (int64, error) {
 	res, err := d.SQL.ExecContext(ctx, `DELETE FROM tasks`)
 	if err != nil { return 0, err }
 	return res.RowsAffected()
+}
+
+func (d *DB) DeleteTasksByExactTitle(ctx context.Context, title string) (int64, error) {
+    res, err := d.SQL.ExecContext(ctx, `DELETE FROM tasks WHERE title = ?`, title)
+    if err != nil { return 0, err }
+    return res.RowsAffected()
+}
+
+func (d *DB) FindTasksByTitleLike(ctx context.Context, q string, limit int) ([]*Task, error) {
+    rows, err := d.SQL.QueryContext(ctx, `
+        SELECT id, creator_id, title, description, voice_file_id, due_at, created_at, updated_at
+        FROM tasks
+        WHERE title LIKE ?
+        ORDER BY created_at DESC
+        LIMIT ?`, "%"+q+"%", limit)
+    if err != nil { return nil, err }
+    defer rows.Close()
+    var out []*Task
+    for rows.Next() {
+        t := &Task{}
+        if err := rows.Scan(&t.ID,&t.CreatorID,&t.Title,&t.Description,&t.VoiceFileID,&t.DueAt,&t.CreatedAt,&t.UpdatedAt); err != nil {
+            return nil, err
+        }
+        out = append(out, t)
+    }
+    return out, nil
+}
+
+func (d *DB) ListDoneExecutorsForTask(ctx context.Context, taskID int64) ([]*User, error) {
+	rows, err := d.SQL.QueryContext(ctx, `
+		SELECT u.id, u.tg_id, u.username, u.role, u.name, u.team, u.created_at
+		FROM task_assignees ta
+		JOIN users u ON u.id = ta.user_id
+		WHERE ta.task_id = ? AND ta.status = 'done'
+		ORDER BY ta.updated_at DESC`, taskID)
+	if err != nil { return nil, err }
+	defer rows.Close()
+
+	var out []*User
+	for rows.Next() {
+		u := &User{}
+		if err := rows.Scan(&u.ID, &u.TgID, &u.Username, &u.Role, &u.Name, &u.Team, &u.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, nil
 }
