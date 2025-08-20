@@ -94,18 +94,24 @@ func (b *Bot) dispatchReminders() {
             }
         case "overdue":
             if r.UserID.Valid {
-                u, err := b.DB.GetUserByID(ctx, r.UserID.Int64)
-                if err == nil {
-                    send(u.TgID, "❗ Просрочено: задача «"+title+"».")
+                uid := r.UserID.Int64
+                done, _ := b.DB.IsAssigneeDone(ctx, r.TaskID, uid) 
+                hasRes, _ := b.DB.HasResult(ctx, r.TaskID, uid)
+                if !done && !hasRes {
+                    if u, err := b.DB.GetUserByID(ctx, uid); err == nil {
+                        send(u.TgID, "❗ Просрочено: задача «"+title+"».")
+                    }
+                    if creator, err := b.DB.GetUserByID(ctx, t.CreatorID); err == nil {
+                        send(creator.TgID, "❗ Просрочена задача «"+title+"». Проверьте статус.")
+                    }
                 }
-            }
-            creator, err := b.DB.GetUserByID(ctx, t.CreatorID)
-            if err == nil {
-                send(creator.TgID, "❗ Просрочена задача «"+title+"». Проверьте статус.")
-            }
+            } else {
+                if creator, err := b.DB.GetUserByID(ctx, t.CreatorID); err == nil {
+                    send(creator.TgID, "❗ Просрочена задача «"+title+"» без назначенного исполнителя.")
+                }
+	}
+     _ = b.DB.MarkReminderSent(ctx, r.ID)
         }
-
-        _ = b.DB.MarkReminderSent(ctx, r.ID)
     }
 }
 
@@ -637,10 +643,17 @@ func (b *Bot) cmdAllActive(m *tgbotapi.Message) {
     for _, t := range ts {
         out.WriteString(fmt.Sprintf("• «%s»\n", nullStr(t.Title))) // было: • #%d %s
         if t.DueAt.Valid { out.WriteString("  Дедлайн: "+t.DueAt.Time.Format("02.01.2006 15:04")+"\n") }
-        ass, _ := b.DB.ListAssigneesWithUsers(ctx, t.ID)
+        ass, _ := b.DB.ListAssigneesWithUsersAny(ctx, t.ID)
         for _, a := range ass {
+            if !a.UserID.Valid {
+                out.WriteString(fmt.Sprintf("  - [без исполнителя]: %s\n", mapStatus(a.Status)))
+                continue
+            }
             out.WriteString(fmt.Sprintf("  - %s @%s [%s]: %s\n",
-                nullStr(a.Name), nullStr(a.Username), nullStr(a.Team), mapStatus(a.Status)))
+                ifEmpty(a.Name.String, "—"),
+                a.Username.String,
+                a.Team.String,
+                mapStatus(a.Status)))
         }
         out.WriteString("\n")
     }
@@ -812,7 +825,7 @@ func (b *Bot) createTaskFromDraft(chatID, bossTgID int64, d *NewTaskDraft) {
     if due.Time.After(now) {
         _ = b.DB.CreateReminders(ctx, id, uids, []time.Time{due.Time}, "deadline")
     }
-    ov := due.Time.Add(30 * time.Minute)
+    ov := due.Time.Add(15 * time.Minute)
     if ov.After(now) {
         _ = b.DB.CreateReminders(ctx, id, uids, []time.Time{ov}, "overdue")
     }
@@ -857,16 +870,28 @@ func (b *Bot) userLabel(u *sqlite.User) string {
 }
 
 func (b *Bot) cmdDone(m *tgbotapi.Message) {
-    ctx := context.Background()
-    ts, comps, err := b.DB.ListDoneTasksForBoss(ctx, 30)
-    if err != nil || len(ts) == 0 { b.reply(m.Chat.ID, "Выполненных задач пока нет."); return }
-    var sb strings.Builder
-    sb.WriteString("Выполненные задачи:\n")
-    for i, t := range ts {
-        sb.WriteString(fmt.Sprintf("• «%s» (готово: %s)\n",
-            nullStr(t.Title), comps[i].In(b.TZ).Format("02.01 15:04")))
-    }
-    b.reply(m.Chat.ID, sb.String())
+	ctx := context.Background()
+	ts, comps, err := b.DB.ListDoneTasksForBoss(ctx, 30)
+	if err != nil || len(ts) == 0 { b.reply(m.Chat.ID, "Выполненных задач пока нет."); return }
+
+	var sb strings.Builder
+	sb.WriteString("Выполненные задачи:\n")
+	for i, t := range ts {
+		sb.WriteString(fmt.Sprintf("• «%s» (готово: %s)\n",
+			nullStr(t.Title), comps[i].In(b.TZ).Format("02.01 15:04")))
+		execs, _ := b.DB.ListDoneExecutorsForTask(ctx, t.ID)
+		if len(execs) > 0 {
+			sb.WriteString("  Выполнили: ")
+			var names []string
+			for _, e := range execs {
+				n := strings.TrimSpace(ifEmpty(e.Name.String, "@"+e.Username.String))
+				if n == "" { n = "[без имени]" }
+				names = append(names, n)
+			}
+			sb.WriteString(strings.Join(names, ", ") + "\n")
+		}
+	}
+	b.reply(m.Chat.ID, sb.String())
 }
 
 func (b *Bot) cmdMyDone(m *tgbotapi.Message) {
@@ -911,3 +936,4 @@ func (b *Bot) pingOrphans() {
         b.API.Send(msg)
     }
 }
+

@@ -14,16 +14,52 @@ type DB struct {
 }
 
 func Open(path string) (*DB, error) {
-	dsn := path + "?_pragma=busy_timeout(5000)"
-	s, err := sql.Open("sqlite", dsn)
+	dsn := path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(15000)"
+
+	var s *sql.DB
+	var err error
+
+	for i := 0; i < 6; i++ { 
+		s, err = sql.Open("sqlite", dsn)
+		if err == nil {
+			break
+		}
+		time.Sleep(time.Duration(100*(i+1)) * time.Millisecond)
+	}
 	if err != nil {
 		return nil, err
 	}
-	s.SetMaxOpenConns(1)
 
-	if err := migrate(context.Background(), s); err != nil {
+	s.SetMaxOpenConns(2)
+	s.SetMaxIdleConns(2)
+
+
+	if err := s.Ping(); err != nil {
+		_ = s.Close()
 		return nil, err
 	}
+
+	for i := 0; i < 5; i++ {
+		err = migrate(context.Background(), s)
+		if err == nil {
+			break
+		}
+		if strings.Contains(strings.ToUpper(err.Error()), "SQLITE_BUSY") ||
+			strings.Contains(strings.ToUpper(err.Error()), "DATABASE IS LOCKED") {
+			time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
+			continue
+		}
+		_ = s.Close()
+		return nil, err
+	}
+	if err != nil {
+		_ = s.Close()
+		return nil, err
+	}
+
+	s.SetMaxOpenConns(1)
+	s.SetMaxIdleConns(1)
+
 	return &DB{SQL: s}, nil
 }
 
@@ -105,8 +141,14 @@ func ensureTaskAssigneesSchema(ctx context.Context, db *sql.DB) error {
 	).Scan(&cnt); err != nil {
 		return err
 	}
+
 	if cnt == 0 {
-		if _, err := db.ExecContext(ctx, `
+
+		conn, err := db.Conn(ctx)
+		if err != nil { return err }
+		defer conn.Close()
+
+		if _, err := conn.ExecContext(ctx, `
 			CREATE TABLE task_assignees (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -117,7 +159,7 @@ func ensureTaskAssigneesSchema(ctx context.Context, db *sql.DB) error {
 		`); err != nil {
 			return err
 		}
-		_, _ = db.ExecContext(ctx, `
+		_, _ = conn.ExecContext(ctx, `
 			CREATE UNIQUE INDEX IF NOT EXISTS idx_task_assignees_unique
 			ON task_assignees(task_id, user_id)
 			WHERE user_id IS NOT NULL;
@@ -125,49 +167,34 @@ func ensureTaskAssigneesSchema(ctx context.Context, db *sql.DB) error {
 		return nil
 	}
 
-	type colInfo struct {
-		notnull int
-	}
+	type colInfo struct{ notnull int }
 	cols := map[string]colInfo{}
 	rows, err := db.QueryContext(ctx, `PRAGMA table_info(task_assignees)`)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 	defer rows.Close()
 	for rows.Next() {
 		var cid int
 		var name, ctype string
 		var notnull, pk int
 		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return err
-		}
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil { return err }
 		cols[name] = colInfo{notnull: notnull}
 	}
 	userNotNull := 0
-	if c, ok := cols["user_id"]; ok {
-		userNotNull = c.notnull
-	}
+	if c, ok := cols["user_id"]; ok { userNotNull = c.notnull }
 
 	onDelete := ""
 	fkRows, err := db.QueryContext(ctx, `PRAGMA foreign_key_list(task_assignees)`)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 	defer fkRows.Close()
 	for fkRows.Next() {
 		var id, seq int
 		var table, from, to, onUpdate, onDel, match string
-		if err := fkRows.Scan(&id, &seq, &table, &from, &to, &onUpdate, &onDel, &match); err != nil {
-			return err
-		}
-		if from == "user_id" {
-			onDelete = onDel
-			break
-		}
+		if err := fkRows.Scan(&id, &seq, &table, &from, &to, &onUpdate, &onDel, &match); err != nil { return err }
+		if from == "user_id" { onDelete = onDel; break }
 	}
-	needMigrate := (userNotNull == 1) || (strings.ToUpper(onDelete) != "SET NULL")
 
+	needMigrate := (userNotNull == 1) || (strings.ToUpper(onDelete) != "SET NULL")
 	if !needMigrate {
 		_, _ = db.ExecContext(ctx, `
 			CREATE UNIQUE INDEX IF NOT EXISTS idx_task_assignees_unique
@@ -177,13 +204,14 @@ func ensureTaskAssigneesSchema(ctx context.Context, db *sql.DB) error {
 		return nil
 	}
 
-	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys=OFF;`); err != nil {
-		return err
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
+	conn, err := db.Conn(ctx)
+	if err != nil { return err }
+
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA foreign_keys=OFF;`); err != nil { return err }
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil { return err }
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx, `
@@ -194,36 +222,24 @@ func ensureTaskAssigneesSchema(ctx context.Context, db *sql.DB) error {
 			status TEXT NOT NULL DEFAULT 'new',
 			updated_at DATETIME NOT NULL
 		);
-	`); err != nil {
-		return err
-	}
+	`); err != nil { return err }
 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO task_assignees_new (id, task_id, user_id, status, updated_at)
 		SELECT id, task_id, user_id, status, updated_at FROM task_assignees;
-	`); err != nil {
-		return err
-	}
+	`); err != nil { return err }
 
-	if _, err := tx.ExecContext(ctx, `DROP TABLE task_assignees;`); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `ALTER TABLE task_assignees_new RENAME TO task_assignees;`); err != nil {
-		return err
-	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE task_assignees;`); err != nil { return err }
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE task_assignees_new RENAME TO task_assignees;`); err != nil { return err }
 
 	if _, err := tx.ExecContext(ctx, `
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_task_assignees_unique
 		ON task_assignees(task_id, user_id)
 		WHERE user_id IS NOT NULL;
-	`); err != nil {
-		return err
-	}
+	`); err != nil { return err }
 
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	_, _ = db.ExecContext(ctx, `PRAGMA foreign_keys=ON;`)
+	if err := tx.Commit(); err != nil { return err }
+	_, _ = conn.ExecContext(ctx, `PRAGMA foreign_keys=ON;`)
 	return nil
 }
 

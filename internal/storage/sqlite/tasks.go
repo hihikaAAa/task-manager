@@ -34,6 +34,14 @@ type AssigneeRow struct {
     Status   string
 }
 
+type AssigneeWithUser struct {
+	UserID   sql.NullInt64
+	Status   string
+	Name     sql.NullString
+	Username sql.NullString
+	Team     sql.NullString
+}
+
 func (d *DB) CreateTask(ctx context.Context, t *Task, assigneeIDs []int64) (int64, error) {
     now := Now()
     res, err := d.SQL.ExecContext(ctx, `
@@ -258,23 +266,26 @@ func (d *DB) ListDoneTasksForBoss(ctx context.Context, limit int) ([]*Task, []ti
 
 
 func (d *DB) ListDoneTasksForUser(ctx context.Context, userID int64, limit int) ([]*Task, []time.Time, error) {
-    rows, err := d.SQL.QueryContext(ctx, `
-        SELECT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at, t.created_at, t.updated_at,
-               ta.updated_at as completed_at
-        FROM tasks t
-        JOIN task_assignees ta ON ta.task_id = t.id
-        WHERE ta.user_id=? AND ta.status='done'
-        ORDER BY ta.updated_at DESC
-        LIMIT ?`, userID, limit)
-    if err != nil { return nil, nil, err }
-    defer rows.Close()
-    var ts []*Task; var comps []time.Time
-    for rows.Next() {
-        t := &Task{}; var comp time.Time
-        if err := rows.Scan(&t.ID,&t.CreatorID,&t.Title,&t.Description,&t.VoiceFileID,&t.DueAt,&t.CreatedAt,&t.UpdatedAt,&comp); err != nil { return nil,nil,err }
-        ts = append(ts, t); comps = append(comps, comp)
-    }
-    return ts, comps, nil
+	rows, err := d.SQL.QueryContext(ctx, `
+		SELECT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at, t.created_at, t.updated_at,
+		       ta.updated_at AS completed_at
+		FROM tasks t
+		JOIN task_assignees ta ON ta.task_id = t.id
+		WHERE ta.user_id = ? AND ta.status='done'
+		ORDER BY ta.updated_at DESC
+		LIMIT ?`, userID, limit)
+	if err != nil { return nil, nil, err }
+	defer rows.Close()
+
+	var ts []*Task; var comps []time.Time
+	for rows.Next() {
+		t := &Task{}; var comp time.Time
+		if err := rows.Scan(&t.ID,&t.CreatorID,&t.Title,&t.Description,&t.VoiceFileID,&t.DueAt,&t.CreatedAt,&t.UpdatedAt,&comp); err != nil {
+			return nil, nil, err
+		}
+		ts = append(ts, t); comps = append(comps, comp)
+	}
+	return ts, comps, nil
 }
 
 func (d *DB) ListTasksWithoutAssignees(ctx context.Context) ([]*Task, error) {
@@ -299,4 +310,35 @@ func (d *DB) ListTasksWithoutAssignees(ctx context.Context) ([]*Task, error) {
     return out, nil
 }
 
+func (d *DB) ListAssigneesWithUsersAny(ctx context.Context, taskID int64) ([]*AssigneeWithUser, error) {
+	rows, err := d.SQL.QueryContext(ctx, `
+		SELECT ta.user_id, ta.status, u.name, u.username, u.team
+		FROM task_assignees ta
+		LEFT JOIN users u ON u.id = ta.user_id
+		WHERE ta.task_id = ?
+		ORDER BY COALESCE(u.name, u.username)`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 
+	var out []*AssigneeWithUser
+	for rows.Next() {
+		r := &AssigneeWithUser{}
+		if err := rows.Scan(&r.UserID, &r.Status, &r.Name, &r.Username, &r.Team); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (d *DB) IsAssigneeDone(ctx context.Context, taskID, userID int64) (bool, error) {
+	var st string
+	err := d.SQL.QueryRowContext(ctx,
+		`SELECT status FROM task_assignees WHERE task_id=? AND user_id=?`,
+		taskID, userID).Scan(&st)
+	if err == sql.ErrNoRows { return false, nil }
+	if err != nil { return false, err }
+	return st == "done", nil
+}

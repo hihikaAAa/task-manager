@@ -127,3 +127,26 @@ func (d *DB) GetUserByID(ctx context.Context, id int64) (*User, error) {
     }
     return u, nil
 }
+
+func (d *DB) ListDoneExecutorsForTask(ctx context.Context, taskID int64) ([]*AssigneeWithUser, error) {
+	rows, err := d.SQL.QueryContext(ctx, `
+		SELECT ta.user_id, ta.status, u.name, u.username, u.team
+		FROM task_assignees ta
+		LEFT JOIN users u ON u.id = ta.user_id
+		WHERE ta.task_id = ? AND ta.status='done'
+		ORDER BY ta.updated_at DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*AssigneeWithUser
+	for rows.Next() {
+		r := &AssigneeWithUser{}
+		if err := rows.Scan(&r.UserID, &r.Status, &r.Name, &r.Username, &r.Team); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
