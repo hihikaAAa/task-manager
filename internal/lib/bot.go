@@ -169,6 +169,13 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
             b.forwardError(m.From, arg)
             b.reply(m.Chat.ID, "Спасибо! Сообщение об ошибке отправлено.")
             return
+        case "done":
+            if !b.isBoss(m.From.ID) { b.reply(m.Chat.ID, "Только для боссов."); return }
+            b.cmdDone(m)
+        case "mydone":
+            if b.isBoss(m.From.ID) { b.reply(m.Chat.ID, "Команда недоступна для боссов."); return }
+            b.cmdMyDone(m)
+
         default:
             b.reply(m.Chat.ID, "Неизвестная команда.")
         }
@@ -241,50 +248,85 @@ func (b *Bot) handleMessage(m *tgbotapi.Message) {
 			return
 		}
 
-		var text *string
-		var fileID *string
 
-		if m.Text != "" { t := m.Text; text = &t }
-		if m.Document != nil { f := m.Document.FileID; fileID = &f }
-		if m.Audio != nil   { f := m.Audio.FileID;   fileID = &f }
-		if m.Voice != nil   { f := m.Voice.FileID;   fileID = &f }
-		if len(m.Photo) > 0 {                    
-			f := m.Photo[len(m.Photo)-1].FileID              
-			fileID = &f
-		}
-		if m.Video != nil { f := m.Video.FileID; fileID = &f }        
+        var text *string
+        var fileID *string
+        fileKind := "" 
 
-		if text == nil && fileID == nil {
-			b.reply(m.Chat.ID, "Пришлите текст результата или файл.")
-			return
-		}
+        if m.Text != "" { t := m.Text; text = &t }
+        switch {
+        case m.Document != nil:
+            f := m.Document.FileID; fileID = &f; fileKind = "document"
+        case m.Voice != nil:
+            f := m.Voice.FileID; fileID = &f; fileKind = "voice"
+        case m.Audio != nil:
+            f := m.Audio.FileID; fileID = &f; fileKind = "audio"
+        case len(m.Photo) > 0:
+            f := m.Photo[len(m.Photo)-1].FileID; fileID = &f; fileKind = "photo"
+        case m.Video != nil:
+            f := m.Video.FileID; fileID = &f; fileKind = "video"
+        }
 
-		if err := b.DB.AddResult(ctx, pld.TaskID, user.ID, text, fileID); err != nil {
-			log.Println("add result:", err)
-		}
+        if text == nil && fileID == nil {
+            b.reply(m.Chat.ID, "Пришлите текст результата или файл.")
+            return
+        }
 
-		t, _ := b.DB.GetTask(ctx, pld.TaskID)
-		creator, _ := b.DB.GetUserByID(ctx, t.CreatorID)
+        if err := b.DB.AddResult(ctx, pld.TaskID, user.ID, text, fileID); err != nil {
+            log.Println("add result:", err)
+        }
 
-		msg := fmt.Sprintf("📎 Получен результат по задаче #%d от @%s",
-			pld.TaskID, ifEmpty(user.Username.String, "user"))
-		b.API.Send(tgbotapi.NewMessage(creator.TgID, msg))
-		if text != nil { b.API.Send(tgbotapi.NewMessage(creator.TgID, *text)) }
-		if fileID != nil { b.API.Send(tgbotapi.NewDocument(creator.TgID, tgbotapi.FileID(*fileID))) }
+        t, _ := b.DB.GetTask(ctx, pld.TaskID)
+        creator, _ := b.DB.GetUserByID(ctx, t.CreatorID)
 
-		_ = b.DB.ClearState(ctx, m.From.ID)                       
+        fullName := nullStr(user.Name)
+        if strings.TrimSpace(fullName) == "" {
+            fullName = strings.TrimSpace(strings.TrimSpace(m.From.FirstName + " " + m.From.LastName))
+        }
+        tag := ifEmpty(user.Username.String, m.From.UserName)
+        if tag != "" { tag = "(@" + tag + ")" }
 
+        head := fmt.Sprintf("📎 Получен результат по задаче «%s» от %s %s",
+            nullStr(t.Title), strings.TrimSpace(fullName), strings.TrimSpace(tag))
 
-		kb := tgbotapi.NewInlineKeyboardMarkup(
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("✔️ Сделано", fmt.Sprintf("task_action:done:%d", pld.TaskID)),
-				tgbotapi.NewInlineKeyboardButtonData("📎 Отправить ещё", fmt.Sprintf("task_action:upload:%d", pld.TaskID)),
-			),
-		)
-		hint := tgbotapi.NewMessage(m.Chat.ID, "Результат отправлен. Теперь можно отметить задачу как выполненную.")
-		hint.ReplyMarkup = kb
-		b.API.Send(hint)
-		return
+        if _, err := b.API.Send(tgbotapi.NewMessage(creator.TgID, head)); err != nil {
+            log.Println("send head to boss:", err)
+        }
+        if text != nil {
+            if _, err := b.API.Send(tgbotapi.NewMessage(creator.TgID, *text)); err != nil {
+                log.Println("send text to boss:", err)
+            }
+        }
+        if fileID != nil {
+            var _, err error
+            switch fileKind {
+            case "document":
+                _, err = b.API.Send(tgbotapi.NewDocument(creator.TgID, tgbotapi.FileID(*fileID)))
+            case "voice":
+                _, err = b.API.Send(tgbotapi.NewVoice(creator.TgID, tgbotapi.FileID(*fileID)))
+            case "audio":
+                _, err = b.API.Send(tgbotapi.NewAudio(creator.TgID, tgbotapi.FileID(*fileID)))
+            case "photo":
+                _, err = b.API.Send(tgbotapi.NewPhoto(creator.TgID, tgbotapi.FileID(*fileID)))
+            case "video":
+                _, err = b.API.Send(tgbotapi.NewVideo(creator.TgID, tgbotapi.FileID(*fileID)))
+            }
+            if err != nil { log.Println("send file to boss:", err) }
+        }
+
+        _ = b.DB.ClearState(ctx, m.From.ID)
+
+        kb := tgbotapi.NewInlineKeyboardMarkup(
+            tgbotapi.NewInlineKeyboardRow(
+                tgbotapi.NewInlineKeyboardButtonData("✔️ Сделано", fmt.Sprintf("task_action:done:%d", pld.TaskID)),
+                tgbotapi.NewInlineKeyboardButtonData("📎 Отправить ещё", fmt.Sprintf("task_action:upload:%d", pld.TaskID)),
+            ),
+        )
+        hint := tgbotapi.NewMessage(m.Chat.ID, "Результат отправлен. Теперь можно отметить задачу как выполненную.")
+        hint.ReplyMarkup = kb
+        b.API.Send(hint)
+        return
+
 	}
     if b.HandleTextFlow(m) {
 		 return 
@@ -353,30 +395,48 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
         workers, _ := b.DB.ListWorkersByTeam(ctx, team)
         var rows [][]tgbotapi.InlineKeyboardButton
         for _, w := range workers {
-            label := fmt.Sprintf("%s [%s]", nullStr(w.Name), nullStr(w.Team))
-            rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(label, fmt.Sprintf("toggle_user:%d", w.TgID))))
+            label := fmt.Sprintf("%s [%s]", b.userLabel(w), nullStr(w.Team))
+            rows = append(rows,
+                tgbotapi.NewInlineKeyboardRow(
+                    tgbotapi.NewInlineKeyboardButtonData(label, fmt.Sprintf("toggle_user:%d", w.TgID)),
+                ),
+            )
         }
-        rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "assignees_menu")))
+        rows = append(rows,
+            tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "assignees_menu")),
+            tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Далее ▶", "assignees_next")),
+        )
         kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
-        edit := tgbotapi.NewEditMessageTextAndMarkup(cq.Message.Chat.ID, cq.Message.MessageID, "Отметьте сотрудников (повторное нажатие снимает выбор):", kb)
+        edit := tgbotapi.NewEditMessageTextAndMarkup(cq.Message.Chat.ID, cq.Message.MessageID,
+            "Отметьте сотрудников (повторное нажатие снимает выбор):", kb)
         b.API.Send(edit)
         b.API.Request(tgbotapi.NewCallback(cq.ID, "Команда: "+team))
         return
     }
+
     if data == "pick_people" {
         workers, _ := b.DB.ListAllWorkers(ctx)
         var rows [][]tgbotapi.InlineKeyboardButton
         for _, w := range workers {
-            label := fmt.Sprintf("%s [%s]", nullStr(w.Name), nullStr(w.Team))
-            rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(label, fmt.Sprintf("toggle_user:%d", w.TgID))))
+            label := fmt.Sprintf("%s [%s]", b.userLabel(w), nullStr(w.Team))
+            rows = append(rows,
+                tgbotapi.NewInlineKeyboardRow(
+                    tgbotapi.NewInlineKeyboardButtonData(label, fmt.Sprintf("toggle_user:%d", w.TgID)),
+                ),
+            )
         }
-        rows = append(rows, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "assignees_menu")))
+        rows = append(rows,
+            tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("⬅ Назад", "assignees_menu")),
+            tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("Далее ▶", "assignees_next")),
+        )
         kb := tgbotapi.NewInlineKeyboardMarkup(rows...)
-        edit := tgbotapi.NewEditMessageTextAndMarkup(cq.Message.Chat.ID, cq.Message.MessageID, "Отметьте сотрудников (повторное нажатие снимает выбор):", kb)
+        edit := tgbotapi.NewEditMessageTextAndMarkup(cq.Message.Chat.ID, cq.Message.MessageID,
+            "Отметьте сотрудников (повторное нажатие снимает выбор):", kb)
         b.API.Send(edit)
         b.API.Request(tgbotapi.NewCallback(cq.ID, "Список сотрудников"))
         return
     }
+
     if data == "assignees_menu" {
         b.askAssignees(cq.Message.Chat.ID)
         b.API.Request(tgbotapi.NewCallback(cq.ID, "Меню исполнителей"))
@@ -434,20 +494,28 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
         b.onTaskAction(from.ID, cq, action, taskID)
         return
     }
-    if strings.HasPrefix(data, "choose_dept:") {
-        depID, _ := strconv.ParseInt(strings.TrimPrefix(data, "choose_dept:"), 10, 64)
+   if strings.HasPrefix(data, "choose_dept:") {
+    depID, _ := strconv.ParseInt(strings.TrimPrefix(data, "choose_dept:"), 10, 64)
+
     var p map[string]string
     b.DB.LoadState(ctx, from.ID, &p)
-    if err := b.DB.SetWorkerTeamByDeptID(ctx, from.ID, depID); err != nil {
-        b.API.Request(tgbotapi.NewCallback(cq.ID, "Ошибка выбора отдела"))
-        return
+
+    name := strings.TrimSpace(p["name"])
+    if name == "" {
+        name = strings.TrimSpace(strings.TrimSpace(from.FirstName + " " + from.LastName))
+        if name == "" && from.UserName != "" { name = "@" + from.UserName }
+        if name == "" { name = fmt.Sprintf("user-%d", from.ID) }
     }
-    b.DB.ClearState(ctx, from.ID)
+
     dep, _ := b.DB.GetDepartmentByID(ctx, depID)
-    b.API.Send(tgbotapi.NewMessage(cq.Message.Chat.ID, fmt.Sprintf("Готово! %s, ваш отдел: %s.", p["name"], dep.Name)))
+    _ = b.DB.SetWorkerProfile(ctx, from.ID, name, dep.Name)
+
+    b.DB.ClearState(ctx, from.ID)
+    b.API.Send(tgbotapi.NewMessage(cq.Message.Chat.ID,
+        fmt.Sprintf("Готово! Вы зарегистрированы как сотрудник: %s (%s).", name, dep.Name)))
     b.API.Request(tgbotapi.NewCallback(cq.ID, "Отдел выбран"))
     return
-    }
+}
 }
 
 func (b *Bot) onTaskAction(userTgID int64, cq *tgbotapi.CallbackQuery, action string, taskID int64) {
@@ -457,7 +525,7 @@ func (b *Bot) onTaskAction(userTgID int64, cq *tgbotapi.CallbackQuery, action st
 
     switch action {
     case "accept":
-        _ = b.DB.UpdateAssigneeStatus(ctx, taskID, u.ID, "in_progress")
+        _,_ = b.DB.UpdateAssigneeStatus(ctx, taskID, u.ID, "in_progress")
         b.API.Request(tgbotapi.NewCallback(cq.ID, "Статус: В работе"))
     case "done":
         has, _ := b.DB.HasResult(ctx, taskID, u.ID)
@@ -465,13 +533,24 @@ func (b *Bot) onTaskAction(userTgID int64, cq *tgbotapi.CallbackQuery, action st
             b.API.Request(tgbotapi.NewCallback(cq.ID, "Сначала отправьте результат"))
             return
         }
-        _ = b.DB.UpdateAssigneeStatus(ctx, taskID, u.ID, "done")
+        changed, _ := b.DB.UpdateAssigneeStatus(ctx, taskID, u.ID, "done")
+        if !changed {
+            b.API.Request(tgbotapi.NewCallback(cq.ID, "Уже отмечено"))
+            return
+        }
         b.API.Request(tgbotapi.NewCallback(cq.ID, "Отмечено как выполнено"))
         t, _ := b.DB.GetTask(ctx, taskID)
-        creator, _ := b.DB.GetUserByID(ctx, t.CreatorID) 
-        b.API.Send(tgbotapi.NewMessage(creator.TgID, fmt.Sprintf("✔️ Исполнитель @%s завершил задачу #%d", cq.From.UserName, taskID)))
+        creator, _ := b.DB.GetUserByID(ctx, t.CreatorID)
+
+        name := nullStr(u.Name)
+        tag := nullStr(u.Username)
+        if tag != "" { tag = "(@" + tag + ")" }
+        msg := fmt.Sprintf("✔️ Исполнитель %s %s завершил задачу «%s»",
+            strings.TrimSpace(name), strings.TrimSpace(tag), nullStr(t.Title))
+        b.API.Send(tgbotapi.NewMessage(creator.TgID, msg))
+
     case "fail":
-        _ = b.DB.UpdateAssigneeStatus(ctx, taskID, u.ID, "failed")
+        _,_ = b.DB.UpdateAssigneeStatus(ctx, taskID, u.ID, "failed")
         b.API.Request(tgbotapi.NewCallback(cq.ID, "Отмечено: не выполнено"))
     case "upload":
         b.DB.SaveState(ctx, userTgID, StateAwaitResult, map[string]any{"task_id": taskID})
@@ -510,7 +589,7 @@ func (b *Bot) cmdAllActive(m *tgbotapi.Message) {
         ass, _ := b.DB.ListAssigneesWithUsers(ctx, t.ID)
         for _, a := range ass {
             out.WriteString(fmt.Sprintf("  - %s @%s [%s]: %s\n",
-                nullStr(a.Name), nullStr(a.Username), nullStr(a.Team), mapStatus(a.Status)))
+            nullStr(a.Name), nullStr(a.Username), nullStr(a.Team), mapStatus(a.Status)))
         }
         out.WriteString("\n")
     }
@@ -545,7 +624,9 @@ func (b *Bot) cmdDeleteUser(m *tgbotapi.Message) {
 func (b *Bot) formatTasks(ts []*sqlite.Task, withAssignees bool) string {
     var bld strings.Builder
     for _, t := range ts {
-        bld.WriteString(fmt.Sprintf("#%d %s\n", t.ID, nullStr(t.Title)))
+        bld.WriteString(fmt.Sprintf("• %s\n", nullStr(t.Title)))
+// дедлайн как был
+
         if t.DueAt.Valid { bld.WriteString("Дедлайн: "+t.DueAt.Time.Format("02.01.2006 15:04")+"\n") }
         if withAssignees {
             ass, _ := b.DB.ListAssigneesWithUsers(context.Background(), t.ID)
@@ -680,12 +761,14 @@ func (b *Bot) createTaskFromDraft(chatID, bossTgID int64, d *NewTaskDraft) {
     }
 
     for _, tg := range d.AssigneeIDs { b.sendTaskToAssignee(tg, id, task) }
-    b.reply(chatID, fmt.Sprintf("Задача #%d создана и отправлена %d исполнителям.", id, len(d.AssigneeIDs)))
+    b.reply(chatID, fmt.Sprintf("Задача «%s» создана и отправлена %d исполнителям.",
+        nullStr(task.Title), len(d.AssigneeIDs)))
+
 }
 
 func (b *Bot) sendTaskToAssignee(tgID int64, taskID int64, t *sqlite.Task) {
     var text strings.Builder
-    fmt.Fprintf(&text, "Новая задача #%d\n", taskID)
+    fmt.Fprintf(&text, "Задача «%s»\n", nullStr(t.Title))
     if t.Title.Valid { text.WriteString("\n"+t.Title.String+"\n") }
     if t.Description.Valid { text.WriteString("\n"+t.Description.String+"\n") }
     if t.DueAt.Valid { text.WriteString("\nДедлайн: "+t.DueAt.Time.Format("02.01.2006 15:04")+"\n") }
@@ -708,3 +791,37 @@ func strPtrIf(cond bool, s string) *string { if cond {
 	}; 
 	return nil 
 }
+
+func (b *Bot) userLabel(u *sqlite.User) string {
+    if n := nullStr(u.Name); n != "" { return n }
+    if un := nullStr(u.Username); un != "" { return "@" + un }
+    return fmt.Sprintf("%d", u.TgID)
+}
+
+func (b *Bot) cmdDone(m *tgbotapi.Message) {
+    ctx := context.Background()
+    ts, comps, err := b.DB.ListDoneTasksForBoss(ctx, 30)
+    if err != nil || len(ts) == 0 { b.reply(m.Chat.ID, "Выполненных задач пока нет."); return }
+    var sb strings.Builder
+    sb.WriteString("Выполненные задачи:\n")
+    for i, t := range ts {
+        sb.WriteString(fmt.Sprintf("• «%s» (готово: %s)\n",
+            nullStr(t.Title), comps[i].In(b.TZ).Format("02.01 15:04")))
+    }
+    b.reply(m.Chat.ID, sb.String())
+}
+
+func (b *Bot) cmdMyDone(m *tgbotapi.Message) {
+    ctx := context.Background()
+    u, _ := b.DB.GetUserByTgID(ctx, m.From.ID)
+    ts, comps, err := b.DB.ListDoneTasksForUser(ctx, u.ID, 30)
+    if err != nil || len(ts) == 0 { b.reply(m.Chat.ID, "У вас пока нет выполненных задач."); return }
+    var sb strings.Builder
+    sb.WriteString("Ваши выполненные задачи:\n")
+    for i, t := range ts {
+        sb.WriteString(fmt.Sprintf("• «%s» (готово: %s)\n",
+            nullStr(t.Title), comps[i].In(b.TZ).Format("02.01 15:04")))
+    }
+    b.reply(m.Chat.ID, sb.String())
+}
+

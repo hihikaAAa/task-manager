@@ -49,11 +49,18 @@ func (d *DB) CreateTask(ctx context.Context, t *Task, assigneeIDs []int64) (int6
     return id, nil
 }
 
-func (d *DB) UpdateAssigneeStatus(ctx context.Context, taskID, userID int64, status string) error {
+func (d *DB) UpdateAssigneeStatus(ctx context.Context, taskID, userID int64, status string) (bool, error) {
     now := Now()
-    _, err := d.SQL.ExecContext(ctx, `UPDATE task_assignees SET status=?, updated_at=? WHERE task_id=? AND user_id=?`, status, now, taskID, userID)
-    return err
+    res, err := d.SQL.ExecContext(ctx, `
+        UPDATE task_assignees
+        SET status=?, updated_at=?
+        WHERE task_id=? AND user_id=? AND status<>?`,
+        status, now, taskID, userID, status)
+    if err != nil { return false, err }
+    n, _ := res.RowsAffected()
+    return n > 0, nil
 }
+
 
 func (d *DB) GetTask(ctx context.Context, id int64) (*Task, error) {
     row := d.SQL.QueryRowContext(ctx, `SELECT id, creator_id, title, description, voice_file_id, due_at, created_at, updated_at FROM tasks WHERE id=?`, id)
@@ -217,5 +224,49 @@ func (d *DB) HasResult(ctx context.Context, taskID, userID int64) (bool, error) 
         return false, err
     }
     return true, nil
+}
+
+// Список задач, где все исполнители = done. Возвращаем completion = MAX(ta.updated_at).
+func (d *DB) ListDoneTasksForBoss(ctx context.Context, limit int) ([]*Task, []time.Time, error) {
+    rows, err := d.SQL.QueryContext(ctx, `
+        SELECT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at, t.created_at, t.updated_at,
+               MAX(ta.updated_at) as completed_at
+        FROM tasks t
+        JOIN task_assignees ta ON ta.task_id = t.id
+        GROUP BY t.id
+        HAVING SUM(CASE WHEN ta.status='done' THEN 0 ELSE 1 END)=0
+        ORDER BY completed_at DESC
+        LIMIT ?`, limit)
+    if err != nil { return nil, nil, err }
+    defer rows.Close()
+    var ts []*Task
+    var comps []time.Time
+    for rows.Next() {
+        t := &Task{}; var comp time.Time
+        if err := rows.Scan(&t.ID,&t.CreatorID,&t.Title,&t.Description,&t.VoiceFileID,&t.DueAt,&t.CreatedAt,&t.UpdatedAt,&comp); err != nil { return nil,nil,err }
+        ts = append(ts, t); comps = append(comps, comp)
+    }
+    return ts, comps, nil
+}
+
+// Список выполненных задач конкретного исполнителя.
+func (d *DB) ListDoneTasksForUser(ctx context.Context, userID int64, limit int) ([]*Task, []time.Time, error) {
+    rows, err := d.SQL.QueryContext(ctx, `
+        SELECT t.id, t.creator_id, t.title, t.description, t.voice_file_id, t.due_at, t.created_at, t.updated_at,
+               ta.updated_at as completed_at
+        FROM tasks t
+        JOIN task_assignees ta ON ta.task_id = t.id
+        WHERE ta.user_id=? AND ta.status='done'
+        ORDER BY ta.updated_at DESC
+        LIMIT ?`, userID, limit)
+    if err != nil { return nil, nil, err }
+    defer rows.Close()
+    var ts []*Task; var comps []time.Time
+    for rows.Next() {
+        t := &Task{}; var comp time.Time
+        if err := rows.Scan(&t.ID,&t.CreatorID,&t.Title,&t.Description,&t.VoiceFileID,&t.DueAt,&t.CreatedAt,&t.UpdatedAt,&comp); err != nil { return nil,nil,err }
+        ts = append(ts, t); comps = append(comps, comp)
+    }
+    return ts, comps, nil
 }
 
